@@ -1,0 +1,16 @@
+/outputs/*
+!/outputs/.gitkeep
+# Ignore all log files
+*.log
+# Ignore all checkpoints
+checkpoints/*
+!/checkpoints/.gitkeep
+# Ignore all wandb files
+wandb/*
+!/wandb/.gitkeep
+# Ignore all tensorboard files
+runs/*
+!/runs/.gitkeep
+# Ignore python cache files
+__pycache__/
+*.pyc
