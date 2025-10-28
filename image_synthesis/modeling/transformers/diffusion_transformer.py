@@ -329,7 +329,7 @@ class DiffusionTransformer(nn.Module):
         else:
             # Gumbel sample
             out = self.log_sample_categorical(model_log_prob)
-            sampled = [1024] * log_x.shape[0]
+            sampled = [512] * log_x.shape[0]
 
         if to_sample is not None:
             return out, sampled
