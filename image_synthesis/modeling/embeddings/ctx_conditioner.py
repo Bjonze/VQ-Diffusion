@@ -47,7 +47,7 @@ class ScalarTokenizer(nn.Module):
 
         # small init for stability
         nn.init.trunc_normal_(self.feature_emb.weight, std=0.02)
-        self.trainable = False
+        self.trainable = True
         self._set_trainable()
 
     def forward(self, x):

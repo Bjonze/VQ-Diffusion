@@ -151,10 +151,10 @@ class DiffusionTransformer(nn.Module):
         self.zero_vector = None
 
         if learnable_cf:
-            self.empty_text_embed = torch.nn.Parameter(torch.randn(size=(77, 512), requires_grad=True, dtype=torch.float64))
+            self.empty_text_embed = torch.nn.Parameter(torch.randn(size=(19, 512), requires_grad=True, dtype=torch.float64))
 
-        self.prior_rule = 0    # inference rule: 0 for VQ-Diffusion v1, 1 for only high-quality inference, 2 for purity prior
-        self.prior_ps = 1024   # max number to sample per step
+        self.prior_rule = 1    # inference rule: 0 for VQ-Diffusion v1, 1 for only high-quality inference, 2 for purity prior
+        self.prior_ps = 512   # max number to sample per step
         self.prior_weight = 0  # probability adjust parameter, 'r' in Equation.11 of Improved VQ-Diffusion
 
         self.update_n_sample()
@@ -288,6 +288,8 @@ class DiffusionTransformer(nn.Module):
 
         max_sample_per_step = self.prior_ps  # max number to sample per step
         if t[0] > 0 and self.prior_rule > 0 and to_sample is not None: # prior_rule: 0 for VQ-Diffusion v1, 1 for only high-quality inference, 2 for purity prior
+            if t[0] == 50:
+                print("LOL")
             log_x_idx = log_onehot_to_index(log_x)
 
             if self.prior_rule == 1:
@@ -311,6 +313,7 @@ class DiffusionTransformer(nn.Module):
             if _score.sum() < 1e-6:
                 _score += 1
             _score[log_x_idx != self.num_classes - 1] = 0
+            #print(t[0])
 
             for i in range(log_x.shape[0]):
                 n_sample = min(to_sample - sampled[i], max_sample_per_step)
@@ -452,6 +455,10 @@ class DiffusionTransformer(nn.Module):
         We are then returning the PyTorch optimizer object.
         """
         # return super().parameters(recurse=True)
+        for name, p in self.model.named_parameters():
+            if "ScalarTokenizer" in name or "context" in name.lower():
+                print(name, p.requires_grad)
+
         if name is None or name == 'none':
             return super().parameters(recurse=recurse)
         else:

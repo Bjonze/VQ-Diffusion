@@ -129,6 +129,12 @@ class Solver(object):
             else:
                 # NOTE: get the parameters with the given name, the parameters() should be overide
                 parameters = self.model.parameters(name=op_sc['name'])
+
+            for name, p in self.model.named_parameters():
+                if p.requires_grad:
+                    print(f"[OPTIMIZED] {name} | shape: {tuple(p.shape)}")
+                else:
+                    print(f"[FROZEN] {name} | shape: {tuple(p.shape)}")
             
             # build optimizer
             op_cfg = op_sc_cfg.get('optimizer', {'target': 'torch.optim.SGD', 'params': {}})
@@ -273,7 +279,6 @@ class Solver(object):
                             output = self.model(**input)
                     else:
                         output = self.model(**input)
-            
             if phase == 'train':
                 if op_sc['optimizer']['step_iteration'] > 0 and (self.last_iter + 1) % op_sc['optimizer']['step_iteration'] == 0:
                     op_sc['optimizer']['module'].zero_grad()
@@ -439,6 +444,7 @@ class Solver(object):
                 for k in lrs.keys():
                     lr = lrs[k]
                     self.logger.add_scalar(tag='train/{}_lr'.format(k), scalar_value=lrs[k], global_step=self.last_iter)
+                    wandb.log({f"train/{k}_lr": lr}, step=self.last_iter)
 
                 # add lr to info
                 info += ' || {}'.format(self._get_lr())

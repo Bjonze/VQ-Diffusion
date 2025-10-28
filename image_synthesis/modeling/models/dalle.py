@@ -59,7 +59,7 @@ class DALLE(nn.Module):
     def get_ema_model(self):
         return self.transformer
 
-    @torch.no_grad()
+    #@torch.no_grad()
     def prepare_condition(self, batch, condition=None):
         cond_key = self.condition_info['key']
         cond = batch[cond_key] if condition is None else condition
@@ -91,7 +91,7 @@ class DALLE(nn.Module):
         return cont_
 
     @autocast(enabled=False)
-    @torch.no_grad()
+    #@torch.no_grad()
     def prepare_input(self, batch):
         input = self.prepare_condition(batch)
         input.update(self.prepare_content(batch))
