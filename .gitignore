@@ -11,6 +11,9 @@ wandb/*
 # Ignore all tensorboard files
 runs/*
 !/runs/.gitkeep
+#ignore all results files
+results/*
+!/results/.gitkeep
 # Ignore python cache files
 __pycache__/
 *.pyc
