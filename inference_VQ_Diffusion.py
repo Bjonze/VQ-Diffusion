@@ -10,7 +10,7 @@ import sys
 sys.path.append(os.path.join(os.path.dirname(__file__), '../'))
 
 import torch
-import cv2
+#import cv2
 import argparse
 import numpy as np
 import torchvision
@@ -18,7 +18,13 @@ from PIL import Image
 
 from image_synthesis.utils.io import load_yaml_config
 from image_synthesis.modeling.build import build_model
-from image_synthesis.utils.misc import get_model_parameters_info
+from image_synthesis.data.build import build_dataloader
+from image_synthesis.utils.io import load_yaml_config
+from image_synthesis.utils.misc import get_model_parameters_info, merge_opts_to_config
+
+from skimage import measure
+import trimesh
+
 
 class VQ_Diffusion():
     def __init__(self, config, path, imagenet_cf=False):
@@ -110,13 +116,13 @@ class VQ_Diffusion():
         self.model.transformer.prior_weight = prior_weight  # probability adjust parameter, 'r' in Equation.11 of Improved VQ-Diffusion
 
         data_i = {}
-        data_i['text'] = [text]
-        data_i['image'] = None
+        data_i['ctx'] = text
+        data_i['indices'] = None
         condition = text
 
-        str_cond = str(condition)
-        save_root_ = os.path.join(save_root, str_cond)
-        os.makedirs(save_root_, exist_ok=True)
+        #str_cond = str(condition)
+        #save_root_ = os.path.join(save_root, str_cond)
+        #os.makedirs(save_root_, exist_ok=True)
 
         if infer_speed != False:
             add_string = 'r,time'+str(infer_speed)
@@ -134,17 +140,28 @@ class VQ_Diffusion():
 
         # save results
         content = model_out['content']
-        content = content.permute(0, 2, 3, 1).to('cpu').numpy().astype(np.uint8)
-        for b in range(content.shape[0]):
-            cnt = b
-            save_base_name = '{}'.format(str(cnt).zfill(6))
-            save_path = os.path.join(save_root_, save_base_name+'.png')
-            im = Image.fromarray(content[b])
-            im.save(save_path)
+        im = content.squeeze().detach().cpu().numpy()
+        for i, vol in enumerate(im):
+            vol = (vol >= 0.5).astype("float32")  # back to binary pixel space
+            try:
+                verts, faces, _, _ = measure.marching_cubes(vol)
+                mesh = trimesh.Trimesh(vertices=verts, faces=faces, process=False)
+                mesh.export(os.path.join(save_root, f"sample_{i}.stl"))
+            except Exception as e:
+                with open(os.path.join(save_root, f"sample_{i}_meshing_error.txt"), "w") as f:
+                    f.write(str(e))
+        # content = content.permute(0, 2, 3, 1).to('cpu').numpy().astype(np.uint8)
+        # for b in range(content.shape[0]):
+        #     cnt = b
+        #     save_base_name = '{}'.format(str(cnt).zfill(6))
+        #     save_path = os.path.join(save_root_, save_base_name+'.png')
+        #     im = Image.fromarray(content[b])
+        #     im.save(save_path)
 
 
 if __name__ == '__main__':
-    VQ_Diffusion_model = VQ_Diffusion(config='configs/ithq.yaml', path='OUTPUT/pretrained_model/ithq_learnable.pth')
+    k = 10
+    VQ_Diffusion_model = VQ_Diffusion(config='configs/laa_cfg.yaml', path='/storage/code/VQ_diffusion/outputs/laa_cfg/checkpoint/last.pth')
 
     # Inference VQ-Diffusion
     # VQ_Diffusion_model.inference_generate_sample_with_condition("teddy bear playing in the pool", truncation_rate=0.86, save_root="RESULT", batch_size=4)
@@ -154,7 +171,40 @@ if __name__ == '__main__':
     # VQ_Diffusion_model.inference_generate_sample_with_condition("a long exposure photo of waterfall", truncation_rate=1.0, save_root="RESULT", batch_size=4, guidance_scale=5.0, learnable_cf=False)
 
     # Inference Improved VQ-Diffusion with learnable classifier-free sampling
-    VQ_Diffusion_model.inference_generate_sample_with_condition("teddy bear playing in the pool", truncation_rate=1.0, save_root="RESULT", batch_size=4, guidance_scale=5.0)
+    config = load_yaml_config('configs/laa.yaml')
+    config = merge_opts_to_config(config, None)
+    config["dataloader"]["batch_size"] = k
+    dataloader_info = build_dataloader(config, None)
+    #chose a random sample from the dataloader
+    data = next(iter(dataloader_info['validation_loader']))
+
+    batch_size = k #len(data["indices"])
+    VQ_Diffusion_model.model.eval()
+    with torch.no_grad():
+        if batch_size >= 5:
+        #we need to chunk the data
+            for i in range(batch_size):
+                indices = data["indices"][i].unsqueeze(0)
+                condition = data["ctx"][i].unsqueeze(0)
+                VQ_Diffusion_model.inference_generate_sample_with_condition(condition, truncation_rate=1.0, save_root=f"/storage/code/VQ_diffusion/results/synth/shape_{i}", batch_size=4, guidance_scale=5.0, learnable_cf=False)
+                gt_laa = VQ_Diffusion_model.model.content_codec.decode(indices)
+                gt_laa = torch.clamp(gt_laa, min=0.0, max=1.0)
+                im = gt_laa.squeeze().detach().cpu().numpy()
+                gt_save_dir = os.path.join("/storage/code/VQ_diffusion/results/gt", f"shape_{i}")
+                os.makedirs(gt_save_dir, exist_ok=True)
+                vol = (im >= 0.5).astype("float32")  # back to binary pixel space
+                try:
+                    verts, faces, _, _ = measure.marching_cubes(vol, level=0.5)
+                    mesh = trimesh.Trimesh(vertices=verts, faces=faces, process=False)
+                    mesh.export(os.path.join(gt_save_dir, f"gt_shape_{i}.stl"))
+                except Exception as e:
+                    with open(os.path.join(gt_save_dir, f"gt_shape_{i}_meshing_error.txt"), "w") as f:
+                        f.write(str(e))
+
+    #save the ground truth
+    
+    print("done")
+    #VQ_Diffusion_model.model
     # VQ_Diffusion_model.inference_generate_sample_with_condition("a long exposure photo of waterfall", truncation_rate=1.0, save_root="RESULT", batch_size=4, guidance_scale=5.0)
 
     # Inference Improved VQ-Diffusion with fast/high-quality inference

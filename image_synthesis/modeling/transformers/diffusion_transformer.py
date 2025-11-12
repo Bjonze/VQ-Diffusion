@@ -85,7 +85,7 @@ class DiffusionTransformer(nn.Module):
         learnable_cf=False,
     ):
         super().__init__()
-        self.global_step = 0
+        self._global_step = 0
 
 
         if condition_emb_config is None:
@@ -151,9 +151,9 @@ class DiffusionTransformer(nn.Module):
         self.zero_vector = None
 
         if learnable_cf:
-            self.empty_text_embed = torch.nn.Parameter(torch.randn(size=(19, 512), requires_grad=True, dtype=torch.float64))
+            self.empty_text_embed = torch.nn.Parameter(torch.randn(size=(19, 128), requires_grad=True, dtype=torch.float64))
 
-        self.prior_rule = 1    # inference rule: 0 for VQ-Diffusion v1, 1 for only high-quality inference, 2 for purity prior
+        self.prior_rule = 2    # inference rule: 0 for VQ-Diffusion v1, 1 for only high-quality inference, 2 for purity prior
         self.prior_ps = 512   # max number to sample per step
         self.prior_weight = 0  # probability adjust parameter, 'r' in Equation.11 of Improved VQ-Diffusion
 
@@ -162,18 +162,60 @@ class DiffusionTransformer(nn.Module):
         self.learnable_cf = learnable_cf
     
 
+    # def update_n_sample(self):
+    #     if self.num_timesteps == 100:
+    #         if self.prior_ps <= 10:
+    #             self.n_sample = [1, 6] + [11, 10, 10] * 32 + [11, 15]
+    #         else:
+    #             self.n_sample = [1, 10] + [11, 10, 10] * 32 + [11, 11]
+    #     elif self.num_timesteps == 50:
+    #         self.n_sample = [10] + [21, 20] * 24 + [30]
+    #     elif self.num_timesteps == 25:
+    #         self.n_sample = [21] + [41] * 23 + [60]
+    #     elif self.num_timesteps == 10:
+    #         self.n_sample = [69] + [102] * 8 + [139]
     def update_n_sample(self):
+        """
+        Hardcoded per-timestep increments that sum to 512 (for an 8×8×8 latent).
+        Mirrors the original shapes but scaled to 512.
+        """
         if self.num_timesteps == 100:
             if self.prior_ps <= 10:
-                self.n_sample = [1, 6] + [11, 10, 10] * 32 + [11, 15]
+                # 100 steps: 2 (head) + 60 (20×[6,5,5]) + 36 (12×[5,5,5]) + 2 (tail) = 100
+                # Sum: [1,3] -> 4; 20×16 -> 320; 12×15 -> 180; [3,5] -> 8; total = 512
+                self.n_sample = [1, 3] + [x for _ in range(20) for x in (6, 5, 5)] \
+                                        + [x for _ in range(12) for x in (5, 5, 5)] \
+                                        + [3, 5]
             else:
-                self.n_sample = [1, 10] + [11, 10, 10] * 32 + [11, 11]
+                # 100 steps: 2 + 54 (18×[6,5,5]) + 42 (14×[5,5,5]) + 2 = 100
+                # Sum: [1,5] -> 6; 18×16 -> 288; 14×15 -> 210; [3,5] -> 8; total = 512
+                self.n_sample = [1, 5] + [x for _ in range(18) for x in (6, 5, 5)] \
+                                        + [x for _ in range(14) for x in (5, 5, 5)] \
+                                        + [3, 5]
+
         elif self.num_timesteps == 50:
-            self.n_sample = [10] + [21, 20] * 24 + [30]
+            # 50 steps: [5] + 12×[10,10] + 12×[11,10] + [15]
+            # Sum: 5 + 12×20 + 12×21 + 15 = 512
+            self.n_sample = [5] + [x for _ in range(12) for x in (10, 10)] \
+                                + [x for _ in range(12) for x in (11, 10)] \
+                                + [15]
+
         elif self.num_timesteps == 25:
-            self.n_sample = [21] + [41] * 23 + [60]
+            # 25 steps: [11] + 11×[21] + 12×[20] + [30]
+            # Sum: 11 + 11×21 + 12×20 + 30 = 512
+            self.n_sample = [11] + [21] * 11 + [20] * 12 + [30]
+
         elif self.num_timesteps == 10:
-            self.n_sample = [69] + [102] * 8 + [139]
+            # 10 steps: [34] + 8×[51] + [70]
+            # Sum: 34 + 8×51 + 70 = 512
+            self.n_sample = [34] + [51] * 8 + [70]
+
+        else:
+            # Fallback: uniform-ish distribution to 512
+            q, r = divmod(512, self.num_timesteps)
+            self.n_sample = [q] * self.num_timesteps
+            for i in range(r):
+                self.n_sample[i] += 1  # distribute remainder at the front
 
     def multinomial_kl(self, log_prob1, log_prob2):   # compute KL loss on log_prob
         kl = (log_prob1.exp() * (log_prob1 - log_prob2)).sum(dim=1)
@@ -527,10 +569,18 @@ class DiffusionTransformer(nn.Module):
             with autocast(enabled=False):
                 #with torch.no_grad():
                 cond_emb = self.condition_emb(input['condition_token']) # B x Ld x D   #256*1024
+                B, Ld, D = cond_emb.shape 
                 if self.learnable_cf:
-                    is_empty_text = torch.logical_not(input['condition_mask'][:, 2]).unsqueeze(1).unsqueeze(2).repeat(1, 77, 512)
-                    cond_emb = torch.where(is_empty_text, self.empty_text_embed.unsqueeze(0).repeat(cond_emb.shape[0], 1, 1), cond_emb.type_as(self.empty_text_embed))
+                    drop = (torch.rand(batch_size, device=cond_emb.device) < 0.1) if self.training \
+                        else torch.zeros(batch_size, dtype=torch.bool, device=cond_emb.device)
+                    # Broadcast per-example decision to [B, Ld, D]
+                    drop = drop.view(batch_size, 1, 1).expand(batch_size, Ld, D)
+                    empty = self.empty_text_embed.to(cond_emb.dtype).unsqueeze(0).expand(batch_size, Ld, D)
+                    # Swap to empty embedding where 'drop' is True
+                    cond_emb = torch.where(drop, empty, cond_emb)
+
                 cond_emb = cond_emb.float()
+
         else: # share condition embeding with content
             if input.get('condition_embed_token') == None:
                 cond_emb = None
@@ -564,9 +614,9 @@ class DiffusionTransformer(nn.Module):
                         "train/diffusion_keep_mean": diffusion_keep_mean,
                         "train/batch_size": float(batch_size),
                     },
-                    step=self.global_step,
+                    step=self._global_step,
                 )
-                self.global_step += 1
+                self._global_step += 1
 
         # 4) get output, especially loss
         out = {}

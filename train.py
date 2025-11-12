@@ -27,7 +27,7 @@ DIST_URL = 'tcp://%s:%s' % (MASTER_ADDR, MASTER_PORT)
 
 def get_args():
     parser = argparse.ArgumentParser(description='PyTorch Training script')
-    parser.add_argument('--config_file', type=str, default='/storage/code/VQ_diffusion/configs/laa.yaml', 
+    parser.add_argument('--config_file', type=str, default='/storage/code/VQ_diffusion/configs/laa_cfg.yaml', 
                         help='path of config file')
     parser.add_argument('--name', type=str, default='', 
                         help='the name of this experiment, if not provided, set to'
@@ -123,7 +123,7 @@ def main():
         args.world_size = args.ngpus_per_node * args.num_node
 
     # if args.wandb_bool:
-    wandb.init(project="VQ-Diffusion", entity="Bjonze", name="debug")
+    wandb.init(project="VQ-Diffusion", entity="Bjonze", name="LAA_CFG")
     launch(main_worker, args.ngpus_per_node, args.num_node, args.node_rank, args.dist_url, args=(args,))
     # if args.wandb_bool:
     wandb.finish()

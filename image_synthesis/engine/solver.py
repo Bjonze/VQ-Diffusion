@@ -444,7 +444,7 @@ class Solver(object):
                 for k in lrs.keys():
                     lr = lrs[k]
                     self.logger.add_scalar(tag='train/{}_lr'.format(k), scalar_value=lrs[k], global_step=self.last_iter)
-                    wandb.log({f"train/{k}_lr": lr}, step=self.last_iter)
+                    #wandb.log({f"train/{k}_lr": lr}, step=self.last_iter)
 
                 # add lr to info
                 info += ' || {}'.format(self._get_lr())
@@ -544,6 +544,9 @@ class Solver(object):
                         info += ' | {}: {:.4f}'.format(k, float(loss_dict[k]))
                         self.logger.add_scalar(tag='val/{}/{}'.format(loss_n, k), scalar_value=float(loss_dict[k]), global_step=self.last_epoch)
                 self.logger.log_info(info)
+            wandb.log({f"val/loss": overall_loss["none"]["loss"].item()})
+                
+            
 
     def validate(self):
         self.validation_epoch()

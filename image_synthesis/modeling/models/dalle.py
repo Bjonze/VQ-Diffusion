@@ -32,7 +32,7 @@ class DALLE(nn.Module):
         super().__init__()
         self.content_info = content_info
         self.condition_info = condition_info
-        self.guidance_scale = 1.0
+        self.guidance_scale = 5.0
         self.learnable_cf = learnable_cf
         self.content_codec = instantiate_from_config(content_codec_config)
         self.condition_codec = instantiate_from_config(condition_codec_config)
@@ -111,7 +111,7 @@ class DALLE(nn.Module):
     def predict_start_with_truncation(self, func, sample_type):
         if sample_type[-1] == 'p':
             truncation_k = int(sample_type[:-1].replace('top', ''))
-            content_codec = self.content_codec
+            content_codec = self.content_codectransformer
             save_path = self.this_save_path
             def wrapper(*args, **kwards):
                 out = func(*args, **kwards)
@@ -160,12 +160,13 @@ class DALLE(nn.Module):
         else:
             condition = self.prepare_condition(batch=None, condition=condition)
         
-        batch_size = len(batch['text']) * replicate
+        batch_size = len(batch['ctx']) * replicate
 
         if self.learnable_cf:
             cf_cond_emb = self.transformer.empty_text_embed.unsqueeze(0).repeat(batch_size, 1, 1)
         else:
-            batch['text'] = [''] * batch_size
+            #batch['ctx'] = [''] * batch_size
+            batch['ctx'] = torch.zeros_like(batch['ctx']).repeat(batch_size,1) 
             cf_condition = self.prepare_condition(batch=batch)
             cf_cond_emb = self.transformer.condition_emb(cf_condition['condition_token']).float()
         
@@ -209,7 +210,7 @@ class DALLE(nn.Module):
 
         else:
             if 'time' in sample_type and float(sample_type.split(',')[1][4:]) < 1:
-                self.transformer.prior_ps = int(1024 // self.transformer.num_timesteps * float(sample_type.split(',')[1][4:]))
+                self.transformer.prior_ps = int(512 // self.transformer.num_timesteps * float(sample_type.split(',')[1][4:]))
                 if self.transformer.prior_rule == 0:
                     self.transformer.prior_rule = 1
                 self.transformer.update_n_sample()

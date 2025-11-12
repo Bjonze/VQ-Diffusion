@@ -6,6 +6,7 @@ model:
   params:
     content_info: {key: indices}
     condition_info: {key: ctx}
+    learnable_cf: True
     content_codec_config: 
     # target: image_synthesis.modeling.codecs.image_codec.openai_dvae.OpenAIDiscreteVAE
       target: image_synthesis.modeling.codecs.image_codec.VQ_GAN3D.VQGAN3D
@@ -23,11 +24,9 @@ model:
       params:
        context_length: 18     ############# 77 for clip and 256 for dalle
        add_start_and_end: True
-       just_token: False
        with_mask: True
        pad_value: 0 # 0 for clip embedding and -100 for others
        clip_embedding: False     ############################   if we use clip embedding 
-       condition_emb_config: None
        tokenizer_config:
         target: image_synthesis.modeling.embeddings.ctx_conditioner.ScalarTokenizer   #########
         params:
@@ -51,6 +50,7 @@ model:
         auxiliary_loss_weight: 5.0e-4
         adaptive_auxiliary_loss: True
         mask_weight: [1, 1]    # the loss weight on mask region and non-mask region
+        learnable_cf: True #Note that this should be set to true when using learnable condition fusion in DALLE class model config as well
 
         transformer_config:
           target: image_synthesis.modeling.transformers.transformer_utils.Text2ImageTransformer
