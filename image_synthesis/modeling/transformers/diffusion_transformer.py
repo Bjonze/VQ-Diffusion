@@ -480,8 +480,8 @@ class DiffusionTransformer(nn.Module):
 
             loss2 = addition_loss_weight * self.auxiliary_loss_weight * kl_aux_loss / pt
             vb_loss += loss2
-
-        return log_model_prob, vb_loss
+        
+        return log_model_prob, vb_loss, t
 
 
     @property
@@ -552,7 +552,8 @@ class DiffusionTransformer(nn.Module):
             self, 
             input, 
             return_loss=False, 
-            return_logits=True, 
+            return_logits=True,
+            return_timesteps=False, 
             return_att_weight=False,
             is_train=True,
             **kwargs):
@@ -589,7 +590,7 @@ class DiffusionTransformer(nn.Module):
             
         # now we get cond_emb and sample_image
         if is_train == True:
-            log_model_prob, loss = self._train_loss(sample_image, cond_emb)
+            log_model_prob, loss, t = self._train_loss(sample_image, cond_emb)
             loss = loss.sum()/(sample_image.size()[0] * sample_image.size()[1])
 
             if is_primary():
@@ -626,6 +627,8 @@ class DiffusionTransformer(nn.Module):
         if return_loss:
             out['loss'] = loss 
         self.amp = False
+        if return_timesteps:
+            out['t'] = t
         return out
 
 

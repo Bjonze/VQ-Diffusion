@@ -140,7 +140,7 @@ class VQ_Diffusion():
 
         # save results
         content = model_out['content']
-        im = content.squeeze().detach().cpu().numpy()
+        im = content[:,0,:,:,:].squeeze().detach().cpu().numpy()
         for i, vol in enumerate(im):
             vol = (vol >= 0.5).astype("float32")  # back to binary pixel space
             try:
@@ -171,7 +171,7 @@ if __name__ == '__main__':
     # VQ_Diffusion_model.inference_generate_sample_with_condition("a long exposure photo of waterfall", truncation_rate=1.0, save_root="RESULT", batch_size=4, guidance_scale=5.0, learnable_cf=False)
 
     # Inference Improved VQ-Diffusion with learnable classifier-free sampling
-    config = load_yaml_config('configs/laa.yaml')
+    config = load_yaml_config('configs/laa_cfg.yaml')
     config = merge_opts_to_config(config, None)
     config["dataloader"]["batch_size"] = k
     dataloader_info = build_dataloader(config, None)
@@ -188,6 +188,7 @@ if __name__ == '__main__':
                 condition = data["ctx"][i].unsqueeze(0)
                 VQ_Diffusion_model.inference_generate_sample_with_condition(condition, truncation_rate=1.0, save_root=f"/storage/code/VQ_diffusion/results/synth/shape_{i}", batch_size=4, guidance_scale=5.0, learnable_cf=False)
                 gt_laa = VQ_Diffusion_model.model.content_codec.decode(indices)
+                gt_laa = gt_laa[:,0,:,:,:]
                 gt_laa = torch.clamp(gt_laa, min=0.0, max=1.0)
                 im = gt_laa.squeeze().detach().cpu().numpy()
                 gt_save_dir = os.path.join("/storage/code/VQ_diffusion/results/gt", f"shape_{i}")

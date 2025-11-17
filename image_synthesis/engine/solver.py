@@ -22,6 +22,7 @@ from image_synthesis.utils.misc import get_model_parameters_info
 from image_synthesis.engine.lr_scheduler import ReduceLROnPlateauWithWarmup, CosineAnnealingLRWithWarmup
 from image_synthesis.engine.ema import EMA
 from torch.optim.lr_scheduler import ReduceLROnPlateau, CosineAnnealingLR
+
 try:
     from torch.cuda.amp import autocast, GradScaler
     AMP = True
@@ -214,8 +215,8 @@ class Solver(object):
                 os.makedirs(save_dir, exist_ok=True)
                 save_path = os.path.join(save_dir, 'e{}_itr{}_{}'.format(self.last_epoch, self.last_iter%self.dataloader['train_iterations'], get_rank(), suffix))
                 os.makedirs(save_path, exist_ok=True)
-                if torch.is_tensor(v) and v.dim() == 5 and v.shape[1] in [1, 3]: # image
-                    im = v.squeeze().detach().cpu().numpy()
+                if torch.is_tensor(v) and v.dim() == 5 and v.shape[1] in [1, 2, 3]: # image
+                    im = v[:,0,:,:,:].squeeze().detach().cpu().numpy() #Note that with current setup, the mask is in channel 0 
                     for i, vol in enumerate(im):
                         vol = (vol >= 0.5).astype("float32")  # back to binary pixel space
                         try:
@@ -261,6 +262,7 @@ class Solver(object):
             input = {
                 'batch': batch,
                 'return_loss': True,
+                'return_timesteps': True,
                 'step': self.last_iter,
                 }
             if op_sc_n != 'none':
@@ -270,8 +272,19 @@ class Solver(object):
                 if self.args.amp:
                     with autocast():
                         output = self.model(**input)
+                        #now we need to add the LPL loss
+                        if self.last_iter >= self.config['solver'].get('lpl_start_iteration', 0):
+                            soft_z = self.model.content_codec.quantize.logits_to_soft_embedding(output['logits'], temp=1.0, dhw=(8,8,8), straight_through=False)
+                            self.lpl_loss = self.model.lpl(batch['indices'], soft_z, output['t'], self.model.transformer.num_timesteps)
+                            output['loss'] = output['loss'] + 0.1 * self.lpl_loss #TODO: weight for LPL loss
+                            wandb.log({"train/lpl_loss": self.lpl_loss.item()}, step=self.model.transformer._global_step)
                 else:
                     output = self.model(**input)
+                    if self.last_iter >= self.config['solver'].get('lpl_start_iteration', 0):
+                        soft_z = self.model.content_codec.quantize.logits_to_soft_embedding(output['logits'], temp=1.0, dhw=(8,8,8), straight_through=False)
+                        self.lpl_loss = self.model.lpl(batch['indices'], soft_z, output['t'], self.model.transformer.num_timesteps)
+                        output['loss'] = output['loss'] + 0.1 * self.lpl_loss #TODO: weight for LPL loss
+                        wandb.log({"train/lpl_loss": self.lpl_loss.item()}, step=self.model.transformer._global_step)
             else:
                 with torch.no_grad():
                     if self.args.amp:

@@ -1,6 +1,6 @@
 # change from o4
-wandb_bool: True
-name: laa_vqgan3d_dalle #for wandb logging
+wandb_bool: False
+name: laa_vqgan3d_dalle_test #for wandb logging
 model:
   target: image_synthesis.modeling.models.dalle.DALLE
   params:
@@ -14,7 +14,7 @@ model:
         trainable: False
         token_shape: [8, 8, 8]
         config_path: '/storage/code/3D_VQGAN/vq_config.yaml'
-        ckpt_path: '/data/Data/bjorn/models/vq_gan/ema_8x8x8_ctx_cosine/checkpoints/vqgan_epoch_epoch=15.ckpt'
+        ckpt_path: '/data/Data/bjorn/models/vq_gan/ema_8x8x8_ctx_cosine_image_2/checkpoints/vqgan_epoch_epoch=15.ckpt'
         num_tokens: 512
         quantize_number: 0
         mapping_path: None
@@ -97,6 +97,7 @@ solver:
   validation_epochs: 1
   sample_iterations: epoch  # epoch #30000      # how many iterations to perform sampling once ?
   print_specific_things: True
+  lpl_start_iteration: 75000
 
   # config for ema
   ema:
@@ -136,13 +137,13 @@ solver:
 
 dataloader:
   # data_root: data
-  data_root: /data/Data/latent_vectors/vqgan/ema_8x8x8_ctx_cosine
+  data_root: /data/Data/latent_vectors/vqgan/ema_8x8x8_ctx_cosine_image_2
   batch_size: 4
   num_workers: 4
   train_datasets: # a list of configures, so we can combine several schedulers
     - target: image_synthesis.data.npz_indices_ctx_dataset.NPZIndicesCtxDataset
       params:
-        data_root: /data/Data/latent_vectors/vqgan/ema_8x8x8_ctx_cosine/train
+        data_root: /data/Data/latent_vectors/vqgan/ema_8x8x8_ctx_cosine_image_2/train
         phase: train
         #drop_caption_rate: 0.0
         # im_preprocessor_config:
@@ -153,7 +154,7 @@ dataloader:
   validation_datasets:
     - target: image_synthesis.data.npz_indices_ctx_dataset.NPZIndicesCtxDataset
       params:
-        data_root: /data/Data/latent_vectors/vqgan/ema_8x8x8_ctx_cosine/val
+        data_root: /data/Data/latent_vectors/vqgan/ema_8x8x8_ctx_cosine_image_2/val
         phase: val
         # im_preprocessor_config:
         #   target: None

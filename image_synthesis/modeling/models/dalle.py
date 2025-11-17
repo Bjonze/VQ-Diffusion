@@ -9,6 +9,7 @@ import torch
 import math
 from torch import nn
 from image_synthesis.utils.misc import instantiate_from_config
+from image_synthesis.losses.lpl import LatentPerceptualLoss
 import time
 import numpy as np
 from PIL import Image
@@ -38,6 +39,22 @@ class DALLE(nn.Module):
         self.condition_codec = instantiate_from_config(condition_codec_config)
         self.transformer = instantiate_from_config(diffusion_config)
         self.truncation_forward = False
+        layer_names = layer_names  = [
+            "post_quant_conv",
+            "decoder.blocks.2",
+            "decoder.blocks.8",
+            "decoder.blocks.12",
+            "decoder.blocks.17",
+            "decoder.blocks.20",
+        ]
+        self.lpl = LatentPerceptualLoss(
+            decoder=self.content_codec.dec,
+            layer_names=layer_names,
+            layer_weights=[1.0, 1.0, 1.0, 1.0, 1.0, 1.0],
+            snr_gate=0.25,
+            outlier_z=5.0,
+            use_cross_norm=True
+        )
 
     def parameters(self, recurse=True, name=None):
         if name is None or name == 'none':
