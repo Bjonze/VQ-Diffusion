@@ -50,8 +50,7 @@ class DALLE(nn.Module):
         self.lpl = LatentPerceptualLoss(
             decoder=self.content_codec.dec,
             layer_names=layer_names,
-            layer_weights=[1.0, 1.0, 1.0, 1.0, 1.0, 1.0],
-            snr_gate=0.25,
+            snr_gate=5.0,
             outlier_z=5.0,
             use_cross_norm=True
         )

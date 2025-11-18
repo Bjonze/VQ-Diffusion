@@ -275,14 +275,16 @@ class Solver(object):
                         #now we need to add the LPL loss
                         if self.last_iter >= self.config['solver'].get('lpl_start_iteration', 0):
                             soft_z = self.model.content_codec.quantize.logits_to_soft_embedding(output['logits'], temp=1.0, dhw=(8,8,8), straight_through=False)
-                            self.lpl_loss = self.model.lpl(batch['indices'], soft_z, output['t'], self.model.transformer.num_timesteps)
+                            self.lpl_loss = self.model.lpl(batch['indices'], soft_z, snr_t)
+                            snr_t = self.model.transformer.get_snr(output['t'])
                             output['loss'] = output['loss'] + 0.1 * self.lpl_loss #TODO: weight for LPL loss
                             wandb.log({"train/lpl_loss": self.lpl_loss.item()}, step=self.model.transformer._global_step)
                 else:
                     output = self.model(**input)
                     if self.last_iter >= self.config['solver'].get('lpl_start_iteration', 0):
                         soft_z = self.model.content_codec.quantize.logits_to_soft_embedding(output['logits'], temp=1.0, dhw=(8,8,8), straight_through=False)
-                        self.lpl_loss = self.model.lpl(batch['indices'], soft_z, output['t'], self.model.transformer.num_timesteps)
+                        snr_t = self.model.transformer.get_snr(output['t'])
+                        self.lpl_loss = self.model.lpl(batch['indices'], soft_z, snr_t)
                         output['loss'] = output['loss'] + 0.1 * self.lpl_loss #TODO: weight for LPL loss
                         wandb.log({"train/lpl_loss": self.lpl_loss.item()}, step=self.model.transformer._global_step)
             else:

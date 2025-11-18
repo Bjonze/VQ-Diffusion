@@ -45,7 +45,7 @@ class DecoderFeatureWrapper(nn.Module):
             m = getattr(m, part)
         return m
 
-    @torch.no_grad()
+    #@torch.no_grad()
     def features(self, z: torch.Tensor, only_decode: bool) -> List[torch.Tensor]:
         self._feat.clear()
         _ = self.decoder(z, only_decode=only_decode)
@@ -65,25 +65,22 @@ class LatentPerceptualLoss(nn.Module):
         self,
         decoder: nn.Module,
         layer_names: List[str],
-        layer_weights: List[float], # should be w_l = 2^{r_l-r_1} where r_l is the resolution of layer l, and r_1 is the lowest resolution
-        snr_gate: float = 0.25,    # apply when t/T <= snr_gate  (late steps) #reported best performance between 3-6
+        snr_gate: float = 5.0,    # apply when t/T <= snr_gate  (late steps) #reported best performance between 3-6
         outlier_z: float = 5.0,    # mask |z-score| > outlier_z
         use_cross_norm: bool = True # should normalize the predicted and target features using stats from the predicted features
         #note that the authors find that it increases performance best when the LPL loss constitutes approximately 20% of the total loss
         # (w_{lpl} ≈ 3.0 in their case)
     ):
         super().__init__()
-        assert len(layer_names) == len(layer_weights)
         self.wrap = DecoderFeatureWrapper(decoder, layer_names)
         self.layer_names = layer_names
-        self.layer_weights = layer_weights
         self.snr_gate = snr_gate
         self.outlier_z = outlier_z
         self.use_cross_norm = use_cross_norm
 
     def _standardize(self, feat: torch.Tensor, stats_from: torch.Tensor) -> torch.Tensor:
         # per-channel mean/std over spatial dims
-        dims = [2, 3]
+        dims = [2, 3, 4]
         mu = stats_from.mean(dim=dims, keepdim=True)
         sd = stats_from.var(dim=dims, unbiased=False, keepdim=True).add(1e-6).sqrt()
         return (feat - mu) / sd
@@ -97,26 +94,41 @@ class LatentPerceptualLoss(nn.Module):
         self,
         z0: torch.Tensor,               # quantized GT embeddings (no grad)
         z0_hat: torch.Tensor,           # soft predicted embeddings (grad)
-        t: torch.Tensor,                # [B] current timesteps
-        T: int                          # total steps (for gating)
+        snr_t: torch.Tensor,                # signal-to-noise ratio at timestep t
     ) -> torch.Tensor:
 
         # Gate: only apply LPL at late timesteps (low noise).
         # If you have SNR schedule, swap this with an SNR check.
-        # Here we use normalized time τ = t/T.
-        with torch.no_grad():
-            tau = (t.float() / float(T)).view(-1, 1, 1, 1)
-        if (tau <= self.snr_gate).sum() == 0:
+        
+        # all the samples in the batch are above the snr gate, return zero loss
+        B = z0.shape[0]
+        device = z0.device
+
+        # Per-sample gate
+        active_mask = (snr_t <= self.snr_gate)   # True = apply LPL
+        num_active = int(active_mask.sum().item())
+        if num_active == 0:
             return z0_hat.new_zeros([])
 
-        # Compute features. No grad on GT branch; allow grad on predicted.
-        with no_grad(self.wrap.decoder):
-            feats_gt = self.wrap.features(z0, only_decode=False)
-        feats_pred = self.wrap.features(z0_hat, only_decode=True)
+        # Slice batch: only decode active samples
+        z0_a     = z0[active_mask]      # [B_a,C,D,H,W]
+        z0_hat_a = z0_hat[active_mask]  # [B_a,C,D,H,W]
 
-        loss = z0_hat.new_zeros([])
-        for l, (phi_gt, phi_pred, w) in enumerate(zip(feats_gt, feats_pred, self.layer_weights)):
+        # Decode GT branch without grad, pred branch with grad
+        with no_grad(self.wrap.decoder):
+            feats_gt = self.wrap.features(z0_a, only_decode=False)
+        with torch.enable_grad():
+            feats_pred = self.wrap.features(z0_hat_a, only_decode=True)
+
+
+        print([f.requires_grad for f in feats_pred])  # should all be True
+
+        loss = z0_hat.new_zeros([], device=device)
+
+        for l, (phi_gt, phi_pred) in enumerate(zip(feats_gt, feats_pred)):
             B, C, D, H, W = phi_gt.shape
+            if l == 0:
+                DHW0 = D
             # Cross-normalize: standardize both using stats from predicted branch (paper CN).
             if self.use_cross_norm:
                 phi_gt_std  = self._standardize(phi_gt,  phi_pred.detach())
@@ -131,8 +143,10 @@ class LatentPerceptualLoss(nn.Module):
 
             diff = (phi_pr_std - phi_gt_std) * mask
             # channel-wise average of squared error
-            diff2 = (diff ** 2).mean(dim=[2, 3, 4])     # B x C
-            diff2 = diff2.mean(dim=1) / max(C, 1)    # B
-            loss  = loss + w * diff2.mean()
+            diff2 = (diff ** 2).mean(dim=[1, 2, 3, 4])     # B x C
+            #diff2 = diff2.mean(dim=1) #/ max(C, 1)    # B
+            weigth = 2 ** (-D/DHW0)
+            loss = loss + weigth * diff2.mean()
+            #loss  = loss + weigth * diff2.mean()
 
         return loss

@@ -773,3 +773,9 @@ class DiffusionTransformer(nn.Module):
         if return_logits:
             output['logits'] = torch.exp(log_z)
         return output
+
+    def get_snr(self, t: int):
+        log_alphabar_t = self.log_cumprod_at[t]       # scalar (on correct device)
+        alphabar_t = log_alphabar_t.exp()                  # ᾱ_t
+        snr_t = alphabar_t / (1.0 - alphabar_t + 1e-8)     # ᾱ_t / (1 - ᾱ_t)
+        return snr_t

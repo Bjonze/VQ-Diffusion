@@ -97,7 +97,7 @@ solver:
   validation_epochs: 1
   sample_iterations: epoch  # epoch #30000      # how many iterations to perform sampling once ?
   print_specific_things: True
-  lpl_start_iteration: 75000
+  lpl_start_iteration: 0 #75000 #75000?
 
   # config for ema
   ema:
