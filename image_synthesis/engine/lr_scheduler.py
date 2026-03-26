@@ -231,8 +231,20 @@ class CosineAnnealingLRWithWarmup(object):
             self.min_lrs = list(min_lr)
         else:
             self.min_lrs = [min_lr] * len(optimizer.param_groups)
-        self.max_lrs = [lr for lr in self.min_lrs]
-        
+
+        # Set max_lrs to warmup_lr (peak LR after warmup)
+        if warmup_lr is not None:
+            if isinstance(warmup_lr, (list, tuple)):
+                if len(warmup_lr) != len(optimizer.param_groups):
+                    raise ValueError("expected {} warmup_lrs, got {}".format(
+                        len(optimizer.param_groups), len(warmup_lr)))
+                self.max_lrs = list(warmup_lr)
+            else:
+                self.max_lrs = [warmup_lr] * len(optimizer.param_groups)
+        else:
+            # fallback: use initial LR if warmup_lr not set
+            self.max_lrs = [group['lr'] for group in optimizer.param_groups]
+
         self._prepare_for_warmup()
 
     def step(self):

@@ -1,0 +1,166 @@
+# change from o4
+wandb_bool: False
+name: laa_late_lpl #for wandb logging
+model:
+  target: image_synthesis.modeling.models.dalle.DALLE
+  params:
+    content_info: {key: indices}
+    condition_info: {key: ctx}
+    learnable_cf: True
+    content_codec_config: 
+    # target: image_synthesis.modeling.codecs.image_codec.openai_dvae.OpenAIDiscreteVAE
+      target: image_synthesis.modeling.codecs.image_codec.VQ_GAN3D.VQGAN3D
+      params:
+        trainable: False
+        token_shape: [8, 8, 8]
+        config_path: '/storage/code/3D_VQGAN/vq_config.yaml'
+        ckpt_path: '/data/Data/bjorn/models/vq_gan/ema_8x8x8_ctx_cosine_image_3/checkpoints/vqgan_epoch_epoch=15.ckpt'
+        num_tokens: 512
+        quantize_number: 0
+        mapping_path: None
+        # return_logits: True
+    condition_codec_config:
+      target: image_synthesis.modeling.codecs.text_codec.tokenize.Tokenize
+      params:
+       context_length: 18     ############# 77 for clip and 256 for dalle
+       add_start_and_end: True
+       with_mask: True
+       pad_value: 0 # 0 for clip embedding and -100 for others
+       clip_embedding: False     ############################   if we use clip embedding 
+       tokenizer_config:
+        target: image_synthesis.modeling.embeddings.ctx_conditioner.ScalarTokenizer   #########
+        params:
+            num_features: 19 # 18 +1 for EOS
+            token_dim: 128
+            hidden: 64
+            use_transformer: True
+            n_heads: 4
+            n_layers: 2
+            ff_mult: 2
+            dropout: 0.1
+            normalize: True
+        # params:
+        #   end_idx: 49152                              ###################
+    diffusion_config:      
+    # target: image_synthesis.modeling.transformers.gpt_like_transformer.GPTLikeTransformer
+      target: image_synthesis.modeling.transformers.diffusion_transformer.DiffusionTransformer
+      params:
+        diffusion_step: 100
+        alpha_init_type: 'alpha1'       # init_type = fix or cos or linear 
+        auxiliary_loss_weight: 5.0e-4
+        adaptive_auxiliary_loss: True
+        mask_weight: [1, 1]    # the loss weight on mask region and non-mask region
+        learnable_cf: True #Note that this should be set to true when using learnable condition fusion in DALLE class model config as well
+
+        transformer_config:
+          target: image_synthesis.modeling.transformers.transformer_utils.Text2ImageTransformer
+          params:
+            attn_type: 'selfcross'
+            n_layer: 8
+            condition_seq_len: 18    ###### 77 for clip and 256 for dalle
+            content_seq_len: 512  # 32 x 32
+            content_spatial_size: [8, 8, 8]
+            n_embd: 512 # the dim of embedding dims
+            condition_dim: 128
+            n_head: 4 
+            attn_pdrop: 0.0
+            resid_pdrop: 0.0
+            block_activate: GELU2
+            timestep_type: 'adalayernorm'    # adainsnorm or adalayernorm and abs
+            mlp_hidden_times: 2
+        condition_emb_config:
+          target: image_synthesis.modeling.embeddings.ctx_conditioner.ScalarTokenizer
+          params:
+            num_features: 18
+            token_dim: 128
+            hidden: 32
+            use_transformer: True
+            n_heads: 4
+            n_layers: 2
+            ff_mult: 2
+            dropout: 0.1
+            normalize: True
+        content_emb_config:
+          target: image_synthesis.modeling.embeddings.mask3d_image_embedding.DalleMask3DImageEmbedding
+          params:
+            num_embed: 512    #should be quantize_number
+            spatial_size: !!python/tuple [8, 8, 8]
+            embed_dim: 512
+            trainable: True
+            pos_emb_type: embedding
+
+solver:
+  base_lr: 3.0e-6
+  adjust_lr: none # not adjust lr according to total batch_size
+  max_epochs: 100
+  save_epochs: 1
+  validation_epochs: 1
+  sample_iterations: epoch  # epoch #30000      # how many iterations to perform sampling once ?
+  print_specific_things: True
+  lpl_start_iteration: 200000
+
+  # config for ema
+  ema:
+    decay: 0.99
+    update_interval: 25
+    device: cpu
+
+  clip_grad_norm:
+    target: image_synthesis.engine.clip_grad_norm.ClipGradNorm
+    params:
+      start_iteration: 0
+      end_iteration: 5000
+      max_norm: 0.5
+  optimizers_and_schedulers: # a list of configures, so we can config several optimizers and schedulers
+  - name: none # default is None
+    optimizer:
+      target: torch.optim.AdamW
+      params: 
+        betas: !!python/tuple [0.9, 0.96]
+        weight_decay: 4.5e-2
+            # target: ZeroRedundancyOptimizer
+            # optimizer_class: torch.optim.AdamW
+            # params:
+            # betas: !!python/tuple [0.9, 0.96]
+            # weight_decay: 4.5e-2
+    scheduler:
+      step_iteration: 1
+      target: image_synthesis.engine.lr_scheduler.ReduceLROnPlateauWithWarmup
+      params:
+        factor: 0.5
+        patience: 25000
+        min_lr: 1.0e-6
+        threshold: 1.0e-1
+        threshold_mode: rel
+        warmup_lr: 4.5e-4 # the lr to be touched after warmup
+        warmup: 1000 
+
+dataloader:
+  # data_root: data
+  data_root: /data/Data/latent_vectors/vqgan/ema_8x8x8_ctx_cosine_image_3
+  batch_size: 2
+  accumulated_batch_size: 8
+  num_workers: 4
+  train_datasets: # a list of configures, so we can combine several schedulers
+    - target: image_synthesis.data.npz_indices_ctx_dataset.NPZIndicesCtxDataset
+      params:
+        data_root: /data/Data/latent_vectors/vqgan/ema_8x8x8_ctx_cosine_image_3/train
+        phase: train
+        with_name: False
+        #drop_caption_rate: 0.0
+        # im_preprocessor_config:
+        #   target: image_synthesis.data.utils.image_preprocessor.DalleTransformerPreprocessor   # ImageNet
+        #   params:
+        #     size: 256
+        #     phase: train
+  validation_datasets:
+    - target: image_synthesis.data.npz_indices_ctx_dataset.NPZIndicesCtxDataset
+      params:
+        data_root: /data/Data/latent_vectors/vqgan/ema_8x8x8_ctx_cosine_image_3/val
+        phase: val
+        with_name: False
+        # im_preprocessor_config:
+        #   target: None
+        #   params:
+        #     size: 256
+        #     phase: val

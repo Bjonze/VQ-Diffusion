@@ -46,12 +46,12 @@ class Decoder(nn.Module):
         self.w = w
         self.h = h
 
-    @torch.no_grad()
+    #@torch.no_grad()
     def forward(self, indices, only_decode=False):
         if only_decode:
             quant = self.post_quant_conv(indices)
             dec = self.decoder(quant)
-            x = torch.clamp(dec, 0., 1.)
+            x = torch.sigmoid(dec)
             return x
         else:
             b, n = indices.shape
@@ -60,8 +60,26 @@ class Decoder(nn.Module):
             z_q = rearrange(z_q_bdhwc, 'b d h w c -> b c d h w').contiguous() # (B, C, D, H, W)
             quant = self.post_quant_conv(z_q)
             dec = self.decoder(quant)
-            x = torch.clamp(dec, 0., 1.)
+            x = torch.sigmoid(dec)
             return x
+
+class only_post_quant(nn.Module):
+    def __init__(self, post_quant_conv, quantize, d=8, w=8, h=8):
+        super().__init__()
+        self.post_quant_conv = post_quant_conv
+        self.quantize = quantize
+        self.d = d
+        self.w = w
+        self.h = h
+
+    #@torch.no_grad()
+    def forward(self, indices):
+        b, n = indices.shape
+        z_q_flat = self.quantize.embedding.weight[indices]                              # (N, C)
+        z_q_bdhwc = z_q_flat.view(b, self.d, self.h, self.w, -1)
+        z_q = rearrange(z_q_bdhwc, 'b d h w c -> b c d h w').contiguous() # (B, C, D, H, W)
+        quant = self.post_quant_conv(z_q)
+        return quant
 
 class SoftZ(nn.Module):
     def __init__(self, decoder, post_quant_conv, quantize, d=8, w=8, h=8):
@@ -73,7 +91,7 @@ class SoftZ(nn.Module):
         self.w = w
         self.h = h
 
-    @torch.no_grad()
+    #@torch.no_grad()
     def forward(self, probs, temp=1.0):
         B, N, K = probs.shape
         D, H, W = self.d, self.h, self.w
@@ -103,6 +121,7 @@ class VQGAN3D(BaseCodec):
 
         self.enc = Encoder(model.encoder, model.quant_conv, model.quantize)
         self.dec = Decoder(model.decoder, model.post_quant_conv, model.quantize, token_shape[0], token_shape[1], token_shape[2])
+        self.post_quant_conv = only_post_quant(model.post_quant_conv, model.quantize, token_shape[0], token_shape[1], token_shape[2])
         self.quantize = model.quantize
         #self.soft_z = SoftZ(model.decoder, model.post_quant_conv, model.quantize, token_shape[0], token_shape[1], token_shape[2])
 

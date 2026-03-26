@@ -1,0 +1,2 @@
+n_generated,n_training,n_points,normalize,use_squared,symmetric_reduction,top_k,generated_min_mean,generated_min_median,generated_min_p05,generated_min_p95,training_min_mean,training_min_median
+1000,5210,10000,none,False,sum,20,4.276604652404785,4.149960994720459,3.249691736698151,5.797131729125976,4.624639511108398,4.49114990234375

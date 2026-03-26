@@ -1,0 +1,160 @@
+# Improved learnable diffusion schedule (v2)
+# Key changes vs v1:
+#   - log_softmax for numerical stability (no softmax->log->clamp chain)
+#   - schedule_warmup_steps: freeze schedule for first 5000 steps
+#   - schedule_lr_scale: 0.1x the main LR for schedule network
+#   - residual_scale: 0.3 (was 0.1) — more expressive
+#   - endpoint_reg_weight: 0.1 (was 1.0) — zero-init already constrains endpoints
+#   - smoothness_reg_weight: 0.1 (was 0.01) — prevent erratic schedule jumps
+#   - monotonicity_reg_weight: 1.0 (new) — enforce cumulative alpha monotonicity
+wandb_bool: True
+name: laa_learned_schedule_v2
+model:
+  target: image_synthesis.modeling.models.dalle.DALLE
+  params:
+    content_info: {key: indices}
+    condition_info: {key: ctx}
+    learnable_cf: True
+    content_codec_config:
+      target: image_synthesis.modeling.codecs.image_codec.VQ_GAN3D.VQGAN3D
+      params:
+        trainable: False
+        token_shape: [8, 8, 8]
+        config_path: '/storage/code/3D_VQGAN/vq_config.yaml'
+        ckpt_path: '/data/Data/bjorn/models/vq_gan/ema_8x8x8_ctx_cosine_box_cox/checkpoints/vqgan_epoch_epoch=15.ckpt'
+        num_tokens: 512
+        quantize_number: 0
+        mapping_path: None
+    condition_codec_config:
+      target: image_synthesis.modeling.codecs.text_codec.tokenize.Tokenize
+      params:
+       context_length: 18
+       add_start_and_end: True
+       with_mask: True
+       pad_value: 0
+       clip_embedding: False
+       tokenizer_config:
+        target: image_synthesis.modeling.embeddings.ctx_conditioner.ScalarTokenizer
+        params:
+            num_features: 19
+            token_dim: 128
+            hidden: 64
+            use_transformer: True
+            n_heads: 4
+            n_layers: 2
+            ff_mult: 2
+            dropout: 0.1
+            normalize: True
+    diffusion_config:
+      target: image_synthesis.modeling.transformers.diffusion_transformer.DiffusionTransformer
+      params:
+        diffusion_step: 100
+        alpha_init_type: 'alpha1'
+        auxiliary_loss_weight: 5.0e-4
+        adaptive_auxiliary_loss: True
+        mask_weight: [1, 1]
+        learnable_cf: True
+        learnable_schedule: True
+        schedule_warmup_steps: 5000
+        schedule_network_config:
+          t_embed_dim: 128
+          global_feat_dim: 32
+          hidden_dim: 256
+          residual_scale: 0.3
+          endpoint_reg_weight: 0.1
+          smoothness_reg_weight: 0.1
+          monotonicity_reg_weight: 1.0
+
+        transformer_config:
+          target: image_synthesis.modeling.transformers.transformer_utils.Text2ImageTransformer
+          params:
+            attn_type: 'selfcross'
+            n_layer: 8
+            condition_seq_len: 18
+            content_seq_len: 512
+            content_spatial_size: [8, 8, 8]
+            n_embd: 512
+            condition_dim: 128
+            n_head: 4
+            attn_pdrop: 0.0
+            resid_pdrop: 0.0
+            block_activate: GELU2
+            timestep_type: 'adalayernorm'
+            mlp_hidden_times: 2
+        condition_emb_config:
+          target: image_synthesis.modeling.embeddings.ctx_conditioner.ScalarTokenizer
+          params:
+            num_features: 18
+            token_dim: 128
+            hidden: 32
+            use_transformer: True
+            n_heads: 4
+            n_layers: 2
+            ff_mult: 2
+            dropout: 0.1
+            normalize: True
+        content_emb_config:
+          target: image_synthesis.modeling.embeddings.mask3d_image_embedding.DalleMask3DImageEmbedding
+          params:
+            num_embed: 512
+            spatial_size: !!python/tuple [8, 8, 8]
+            embed_dim: 512
+            trainable: True
+            pos_emb_type: embedding
+
+
+solver:
+  base_lr: 1.0e-6
+  adjust_lr: none
+  max_epochs: 300
+  save_epochs: 5
+  validation_epochs: 2
+  sample_iterations: epoch
+  print_specific_things: True
+  lpl_start_iteration: 150000
+  schedule_lr_scale: 0.1  # schedule network gets 0.1x the main LR
+
+  ema:
+    decay: 0.99
+    update_interval: 25
+    device: cpu
+
+  clip_grad_norm:
+    target: image_synthesis.engine.clip_grad_norm.ClipGradNorm
+    params:
+      start_iteration: 0
+      end_iteration: 5000
+      max_norm: 0.5
+  optimizers_and_schedulers:
+  - name: none
+    optimizer:
+      target: torch.optim.AdamW
+      params:
+        betas: !!python/tuple [0.9, 0.96]
+        weight_decay: 4.5e-2
+    scheduler:
+      step_iteration: 1
+      target: image_synthesis.engine.lr_scheduler.CosineAnnealingLRWithWarmup
+      params:
+        T_max: 242100
+        min_lr: 1.0e-6
+        warmup_lr: 1.0e-4
+        warmup: 8060
+
+dataloader:
+  data_root: /data/Data/latent_vectors/vqgan/ema_8x8x8_ctx_cosine_box_cox
+  batch_size: 2
+  accumulated_batch_size: 8
+  num_workers: 4
+  train_datasets:
+    - target: image_synthesis.data.npz_indices_ctx_dataset.NPZIndicesCtxDataset
+      params:
+        data_root: /data/Data/latent_vectors/vqgan/ema_8x8x8_ctx_cosine_box_cox/train
+        phase: train
+        with_name: False
+  validation_datasets:
+    - target: image_synthesis.data.npz_indices_ctx_dataset.NPZIndicesCtxDataset
+      params:
+        data_root: /data/Data/latent_vectors/vqgan/ema_8x8x8_ctx_cosine_box_cox/val
+        phase: val
+        with_name: False

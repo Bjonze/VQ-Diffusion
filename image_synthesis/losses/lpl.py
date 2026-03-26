@@ -17,11 +17,12 @@ def no_grad(module: nn.Module):
 class DecoderFeatureWrapper(nn.Module):
     """
     Wrap a VQ-VAE / VQGAN decoder to return intermediate feature maps.
-    You can pass either the CompVis 'taming' decoder or your own.
+    Handles both hard indices (GT) and soft embeddings (predicted).
     """
     def __init__(self, decoder: nn.Module, layer_names: List[str]):
         super().__init__()
-        self.decoder = decoder.eval()
+        self.decoder = decoder
+        # Freeze decoder parameters
         for p in self.decoder.parameters():
             p.requires_grad = False
 
@@ -45,10 +46,22 @@ class DecoderFeatureWrapper(nn.Module):
             m = getattr(m, part)
         return m
 
-    #@torch.no_grad()
-    def features(self, z: torch.Tensor, only_decode: bool) -> List[torch.Tensor]:
+    def features_from_indices(self, indices: torch.Tensor) -> List[torch.Tensor]:
+        """
+        Get features from hard token indices [B, N].
+        Uses embedding lookup (non-differentiable) - for GT branch.
+        """
         self._feat.clear()
-        _ = self.decoder(z, only_decode=only_decode)
+        _ = self.decoder(indices, only_decode=False)
+        return [self._feat[n] for n in self.layer_names]
+
+    def features_from_embeddings(self, z: torch.Tensor) -> List[torch.Tensor]:
+        """
+        Get features from soft embeddings [B, C, D, H, W].
+        Differentiable - for predicted branch.
+        """
+        self._feat.clear()
+        _ = self.decoder(z, only_decode=True)
         return [self._feat[n] for n in self.layer_names]
 
 
@@ -92,36 +105,39 @@ class LatentPerceptualLoss(nn.Module):
 
     def forward(
         self,
-        z0: torch.Tensor,               # quantized GT embeddings (no grad)
-        z0_hat: torch.Tensor,           # soft predicted embeddings (grad)
-        snr_t: torch.Tensor,                # signal-to-noise ratio at timestep t
+        indices_gt: torch.Tensor,       # GT token indices [B, N] (no grad needed)
+        z0_hat: torch.Tensor,           # soft predicted embeddings [B, C, D, H, W] (grad)
+        snr_t: torch.Tensor,            # signal-to-noise ratio at timestep t [B]
     ) -> torch.Tensor:
-
-        # Gate: only apply LPL at late timesteps (low noise).
-        # If you have SNR schedule, swap this with an SNR check.
+        """
+        Compute LPL loss between GT (from indices) and predicted (from soft embeddings).
         
-        # all the samples in the batch are above the snr gate, return zero loss
-        B = z0.shape[0]
-        device = z0.device
+        Args:
+            indices_gt: Ground truth token indices [B, N], used for hard embedding lookup
+            z0_hat: Soft predicted embeddings [B, C, D, H, W], must be differentiable
+            snr_t: Per-sample SNR values [B], used for gating
+        """
+        B = indices_gt.shape[0]
+        device = indices_gt.device
 
-        # Per-sample gate
-        active_mask = (snr_t <= self.snr_gate)   # True = apply LPL
+        # Per-sample gate: only apply LPL at late timesteps (high SNR = low noise)
+        active_mask = (snr_t >= self.snr_gate)   # True = apply LPL (high SNR = late/clean)
         num_active = int(active_mask.sum().item())
         if num_active == 0:
-            return z0_hat.new_zeros([])
+            # Return zero that maintains gradient connection to z0_hat
+            # This ensures the computational graph stays connected even when gated
+            return (z0_hat * 0.0).sum()
 
         # Slice batch: only decode active samples
-        z0_a     = z0[active_mask]      # [B_a,C,D,H,W]
-        z0_hat_a = z0_hat[active_mask]  # [B_a,C,D,H,W]
+        indices_a = indices_gt[active_mask]  # [B_a, N]
+        z0_hat_a  = z0_hat[active_mask]      # [B_a, C, D, H, W]
 
-        # Decode GT branch without grad, pred branch with grad
-        with no_grad(self.wrap.decoder):
-            feats_gt = self.wrap.features(z0_a, only_decode=False)
-        with torch.enable_grad():
-            feats_pred = self.wrap.features(z0_hat_a, only_decode=True)
-
-
-        print([f.requires_grad for f in feats_pred])  # should all be True
+        # GT branch: indices -> embedding lookup -> post_quant_conv -> decoder (no grad)
+        with torch.no_grad():
+            feats_gt = self.wrap.features_from_indices(indices_a)
+        
+        # Pred branch: soft embeddings -> post_quant_conv -> decoder (with grad)
+        feats_pred = self.wrap.features_from_embeddings(z0_hat_a)
 
         loss = z0_hat.new_zeros([], device=device)
 

@@ -25,7 +25,7 @@ class DALLE(nn.Module):
         *,
         content_info={'key': 'image'},
         condition_info={'key': 'ctx'},
-        learnable_cf=False,
+        learnable_cf=True,
         content_codec_config,
         condition_codec_config,
         diffusion_config
@@ -39,14 +39,19 @@ class DALLE(nn.Module):
         self.condition_codec = instantiate_from_config(condition_codec_config)
         self.transformer = instantiate_from_config(diffusion_config)
         self.truncation_forward = False
-        layer_names = layer_names  = [
+        # LPL feature layers spanning multiple decoder resolutions:
+        # post_quant_conv: 256ch @ 8³ (latent)
+        # blocks.3: ResBlock 512ch @ 8³ (deep features)
+        # blocks.10: ResBlock 256ch @ 16³ (mid-low)
+        # blocks.13: ResBlock 128ch @ 32³ (mid-high)
+        # blocks.16: ResBlock 64ch @ 64³ (near output)
+        layer_names = [
             "post_quant_conv",
-            "decoder.blocks.2",
-            "decoder.blocks.8",
-            "decoder.blocks.12",
-            "decoder.blocks.17",
-            "decoder.blocks.20",
-        ]
+            "decoder.blocks.3",
+            "decoder.blocks.10",
+            "decoder.blocks.13",
+            "decoder.blocks.16",
+            ]
         self.lpl = LatentPerceptualLoss(
             decoder=self.content_codec.dec,
             layer_names=layer_names,
@@ -182,7 +187,10 @@ class DALLE(nn.Module):
             cf_cond_emb = self.transformer.empty_text_embed.unsqueeze(0).repeat(batch_size, 1, 1)
         else:
             #batch['ctx'] = [''] * batch_size
-            batch['ctx'] = torch.zeros_like(batch['ctx']).repeat(batch_size,1) 
+            #if batch_size != 1:
+            #    batch['ctx'] = torch.zeros_like(batch['ctx']).repeat(batch_size,1)
+            #else: 
+            batch['ctx'] = torch.zeros_like(batch['ctx'])
             cf_condition = self.prepare_condition(batch=batch)
             cf_cond_emb = self.transformer.condition_emb(cf_condition['condition_token']).float()
         
@@ -243,6 +251,103 @@ class DALLE(nn.Module):
 
 
         content = self.content_codec.decode(trans_out['content_token'])  #(8,1024)->(8,3,256,256)
+        self.train()
+        out = {
+            'content': content
+        }
+        
+
+        return out
+    
+    @torch.no_grad()
+    def generate_post_quant(
+        self,
+        *,
+        batch,
+        condition=None,
+        filter_ratio = 0.5,
+        temperature = 1.0,
+        content_ratio = 0.0,
+        replicate=1,
+        return_att_weight=False,
+        sample_type="top0.85r",
+    ):
+        self.eval()
+        if condition is None:
+            condition = self.prepare_condition(batch=batch)
+        else:
+            condition = self.prepare_condition(batch=None, condition=condition)
+        
+        batch_size = len(batch['ctx']) * replicate
+
+        if self.learnable_cf:
+            cf_cond_emb = self.transformer.empty_text_embed.unsqueeze(0).repeat(batch_size, 1, 1)
+        else:
+            #batch['ctx'] = [''] * batch_size
+            #if batch_size != 1:
+            #    batch['ctx'] = torch.zeros_like(batch['ctx']).repeat(batch_size,1)
+            #else: 
+            batch['ctx'] = torch.zeros_like(batch['ctx'])
+            cf_condition = self.prepare_condition(batch=batch)
+            cf_cond_emb = self.transformer.condition_emb(cf_condition['condition_token']).float()
+        
+        def cf_predict_start(log_x_t, cond_emb, t):
+            log_x_recon = self.transformer.predict_start(log_x_t, cond_emb, t)[:, :-1]
+            if abs(self.guidance_scale - 1) < 1e-3:
+                return torch.cat((log_x_recon, self.transformer.zero_vector), dim=1)
+            cf_log_x_recon = self.transformer.predict_start(log_x_t, cf_cond_emb.type_as(cond_emb), t)[:, :-1]
+            log_new_x_recon = cf_log_x_recon + self.guidance_scale * (log_x_recon - cf_log_x_recon)
+            log_new_x_recon -= torch.logsumexp(log_new_x_recon, dim=1, keepdim=True)
+            log_new_x_recon = log_new_x_recon.clamp(-70, 0)
+            log_pred = torch.cat((log_new_x_recon, self.transformer.zero_vector), dim=1)
+            return log_pred
+
+        if replicate != 1:
+            for k in condition.keys():
+                if condition[k] is not None:
+                    condition[k] = torch.cat([condition[k] for _ in range(replicate)], dim=0)
+            
+        content_token = None
+
+        if len(sample_type.split(',')) > 1:
+            if sample_type.split(',')[1][:1]=='q':
+                self.transformer.p_sample = self.p_sample_with_truncation(self.transformer.p_sample, sample_type.split(',')[1])
+        if sample_type.split(',')[0][:3] == "top" and self.truncation_forward == False:
+            self.transformer.cf_predict_start = self.predict_start_with_truncation(cf_predict_start, sample_type.split(',')[0])
+            self.truncation_forward = True
+
+        if len(sample_type.split(',')) == 2 and sample_type.split(',')[1][:4]=='time' and int(float(sample_type.split(',')[1][4:])) >= 2:
+            trans_out = self.transformer.sample_fast(condition_token=condition['condition_token'],
+                                                condition_mask=condition.get('condition_mask', None),
+                                                condition_embed=condition.get('condition_embed_token', None),
+                                                content_token=content_token,
+                                                filter_ratio=filter_ratio,
+                                                temperature=temperature,
+                                                return_att_weight=return_att_weight,
+                                                return_logits=False,
+                                                print_log=False,
+                                                sample_type=sample_type,
+                                                skip_step=int(float(sample_type.split(',')[1][4:])-1))
+
+        else:
+            if 'time' in sample_type and float(sample_type.split(',')[1][4:]) < 1:
+                self.transformer.prior_ps = int(512 // self.transformer.num_timesteps * float(sample_type.split(',')[1][4:]))
+                if self.transformer.prior_rule == 0:
+                    self.transformer.prior_rule = 1
+                self.transformer.update_n_sample()
+            trans_out = self.transformer.sample(condition_token=condition['condition_token'],
+                                            condition_mask=condition.get('condition_mask', None),
+                                            condition_embed=condition.get('condition_embed_token', None),
+                                            content_token=content_token,
+                                            filter_ratio=filter_ratio,
+                                            temperature=temperature,
+                                            return_att_weight=return_att_weight,
+                                            return_logits=False,
+                                            print_log=False,
+                                            sample_type=sample_type)
+
+
+        content = self.content_codec.post_quant_conv(trans_out['content_token'])  #(8,1024)->(8,3,256,256)
         self.train()
         out = {
             'content': content

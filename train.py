@@ -27,7 +27,7 @@ DIST_URL = 'tcp://%s:%s' % (MASTER_ADDR, MASTER_PORT)
 
 def get_args():
     parser = argparse.ArgumentParser(description='PyTorch Training script')
-    parser.add_argument('--config_file', type=str, default='/storage/code/VQ_diffusion/configs/laa_cfg.yaml', 
+    parser.add_argument('--config_file', type=str, default='/storage/code/VQ_diffusion/configs/laa_normal_baseline.yaml',
                         help='path of config file')
     parser.add_argument('--name', type=str, default='', 
                         help='the name of this experiment, if not provided, set to'
@@ -66,7 +66,7 @@ def get_args():
     parser.add_argument('--cudnn_deterministic', action='store_true', 
                         help='set cudnn.deterministic True')
 
-    parser.add_argument('--amp', action='store_true', # default=True,
+    parser.add_argument('--amp', action='store_true', default=True,
                         help='automatic mixture of precesion')
 
     parser.add_argument('--debug', action='store_true', default=False,
@@ -122,8 +122,9 @@ def main():
         args.ngpus_per_node = torch.cuda.device_count()
         args.world_size = args.ngpus_per_node * args.num_node
 
-    # if args.wandb_bool:
-    wandb.init(project="VQ-Diffusion", entity="Bjonze", name="LAA_CFG")
+    config = load_yaml_config(args.config_file)
+    wandb_name = config.get('name', args.name)
+    wandb.init(project="VQ-Diffusion", entity="Bjonze", name=wandb_name)
     launch(main_worker, args.ngpus_per_node, args.num_node, args.node_rank, args.dist_url, args=(args,))
     # if args.wandb_bool:
     wandb.finish()

@@ -7,6 +7,7 @@
 
 import os
 import sys
+from datetime import date
 sys.path.append(os.path.join(os.path.dirname(__file__), '../'))
 
 import torch
@@ -180,27 +181,32 @@ if __name__ == '__main__':
 
     batch_size = k #len(data["indices"])
     VQ_Diffusion_model.model.eval()
+    today_str = date.today().strftime("%Y-%m-%d")
+    save_root_synth = f"/storage/code/VQ_diffusion/results/synth_{today_str}"
+    save_root_gt = f"/storage/code/VQ_diffusion/results/gt_{today_str}"
+    os.makedirs(save_root_synth, exist_ok=True)
+    os.makedirs(save_root_gt, exist_ok=True)
     with torch.no_grad():
-        if batch_size >= 5:
-        #we need to chunk the data
-            for i in range(batch_size):
-                indices = data["indices"][i].unsqueeze(0)
-                condition = data["ctx"][i].unsqueeze(0)
-                VQ_Diffusion_model.inference_generate_sample_with_condition(condition, truncation_rate=1.0, save_root=f"/storage/code/VQ_diffusion/results/synth/shape_{i}", batch_size=4, guidance_scale=5.0, learnable_cf=False)
-                gt_laa = VQ_Diffusion_model.model.content_codec.decode(indices)
-                gt_laa = gt_laa[:,0,:,:,:]
-                gt_laa = torch.clamp(gt_laa, min=0.0, max=1.0)
-                im = gt_laa.squeeze().detach().cpu().numpy()
-                gt_save_dir = os.path.join("/storage/code/VQ_diffusion/results/gt", f"shape_{i}")
-                os.makedirs(gt_save_dir, exist_ok=True)
-                vol = (im >= 0.5).astype("float32")  # back to binary pixel space
-                try:
-                    verts, faces, _, _ = measure.marching_cubes(vol, level=0.5)
-                    mesh = trimesh.Trimesh(vertices=verts, faces=faces, process=False)
-                    mesh.export(os.path.join(gt_save_dir, f"gt_shape_{i}.stl"))
-                except Exception as e:
-                    with open(os.path.join(gt_save_dir, f"gt_shape_{i}_meshing_error.txt"), "w") as f:
-                        f.write(str(e))
+        for i in range(batch_size):
+            indices = data["indices"][i].unsqueeze(0)
+            condition = data["ctx"][i].unsqueeze(0)
+            save_root_synth_ = os.path.join(save_root_synth, f"shape_{i}")
+            os.makedirs(save_root_synth_, exist_ok=True)
+            VQ_Diffusion_model.inference_generate_sample_with_condition(condition, truncation_rate=1.0, save_root=save_root_synth_, batch_size=4, guidance_scale=5.0, learnable_cf=False)
+            gt_laa = VQ_Diffusion_model.model.content_codec.decode(indices)
+            gt_laa = gt_laa[:,0,:,:,:]
+            gt_laa = torch.clamp(gt_laa, min=0.0, max=1.0)
+            im = gt_laa.squeeze().detach().cpu().numpy()
+            save_root_gt_ = os.path.join(save_root_gt, f"shape_{i}")
+            os.makedirs(save_root_gt_, exist_ok=True)
+            vol = (im >= 0.5).astype("float32")  # back to binary pixel space
+            try:
+                verts, faces, _, _ = measure.marching_cubes(vol, level=0.5)
+                mesh = trimesh.Trimesh(vertices=verts, faces=faces, process=False)
+                mesh.export(os.path.join(save_root_gt_, f"gt_shape_{i}.stl"))
+            except Exception as e:
+                with open(os.path.join(save_root_gt, f"gt_shape_{i}_meshing_error.txt"), "w") as f:
+                    f.write(str(e))
 
     #save the ground truth
     

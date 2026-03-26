@@ -303,66 +303,60 @@ class EMAVectorQuantizer3D(nn.Module):
 
     def logits_to_soft_embedding(
         self,
-        logits: torch.Tensor,                    # [B, N, K]
+        probs: torch.Tensor,                     # [B, N, K] probabilities (already softmaxed)
         temp: float = 1.0,
         dhw: tuple | None = None,               # (D,H,W); if None we'll try to infer as a cube
         straight_through: bool = False          # if True, add ST quantization on top of soft z
     ) -> torch.Tensor:
         """
-        Convert token logits to a soft expected embedding volume using this module's codebook.
+        Convert token probabilities to a soft expected embedding volume using this module's codebook.
 
         Args:
-            logits: [B, N, K] where N = D*H*W, K = vocab size
-            temp: softmax temperature
+            probs: [B, N, K] where N = D*H*W, K = vocab size (already excludes mask token)
+            temp: temperature for sharpening (< 1 sharpens, > 1 softens)
             dhw: optional (D,H,W). If omitted we try to infer a cube; otherwise raise ValueError.
             straight_through: if True, returns z_soft + (z_hard - z_soft).detach() (nearest-token ST)
 
         Returns:
             z: [B, C, D, H, W], where C == self.codebook_dim
         """
-        B, N, K = logits.shape
+        B, N, K = probs.shape
         if K != self.num_tokens:
-            raise ValueError(f"logits K={K} != codebook size {self.num_tokens}")
+            raise ValueError(f"probs K={K} != codebook size {self.num_tokens}")
 
         # decide spatial shape
         if dhw is None:
-            dhw = self._infer_dhw_from_N(N-1)
+            dhw = self._infer_dhw_from_N(N)
             if dhw is None:
                 raise ValueError(
-                    f"Cannot infer (D,H,W) from N={N-1}. Pass dhw=(D,H,W)."
+                    f"Cannot infer (D,H,W) from N={N}. Pass dhw=(D,H,W)."
                 )
         D, H, W = dhw
-        if D * H * W != N-1:
-            raise ValueError(f"dhw={dhw} implies {D*H*W} tokens, but logits have N={N}.")
+        if D * H * W != N:
+            raise ValueError(f"dhw={dhw} implies {D*H*W} tokens, but probs have N={N}.")
 
-        #we have to remove the mask token logits which is the last token
-        logits = logits[:,:-1,:]  # [B, N-1, K]
-        #and then renormalize the logits
-        logits = logits / (logits.sum(dim=1, keepdim=True) + 1e-12)
-        # soft expectation over codebook
-        if temp == 1.0:
-            probs = logits
-        else:
-            probs = logits.pow(1.0 / temp)
-            probs = logits / logits.sum(dim=-1, keepdim=True)     # re-normalize
+        # Apply temperature sharpening if needed
+        if temp != 1.0:
+            probs = probs.pow(1.0 / temp)
+            probs = probs / probs.sum(dim=-1, keepdim=True)
 
-        #probs = F.softmax(logits / temp, dim=-1)            # [B, N, K]
-        probs = probs.permute(0, 2, 1)                     # batch_size x n_emb x seq_len -> batch_size x seq_len x n_emb
+        # Soft embedding: weighted sum of codebook vectors
+        # probs: [B, N, K], codebook: [K, C] -> z_flat: [B, N, C]
+        codebook = self.embedding.weight  # [K, C]
+        z_flat = probs @ codebook  # [B, N, C]
 
-        codebook = self.embedding.weight                    # [K, C]
-        z_flat = probs @ codebook                           # [B, N, C]
+        # Reshape to spatial volume [B, C, D, H, W]
         z_soft = z_flat.view(B, D, H, W, self.codebook_dim).permute(0, 4, 1, 2, 3).contiguous()
 
         if not straight_through:
             return z_soft
 
-        # straight-through hardening (optional)
+        # Straight-through: forward uses hard, backward uses soft
         with torch.no_grad():
-            hard_idx = probs.argmax(dim=-1)                 # [B, N]
-            z_hard_flat = F.embedding(hard_idx, codebook)   # [B, N, C]
+            hard_idx = probs.argmax(dim=-1)  # [B, N]
+            z_hard_flat = F.embedding(hard_idx, codebook)  # [B, N, C]
             z_hard = z_hard_flat.view(B, D, H, W, self.codebook_dim).permute(0, 4, 1, 2, 3).contiguous()
 
-        # ST: forward = hard, backward = soft
         return z_soft + (z_hard - z_soft).detach()
 
 

@@ -6,6 +6,7 @@
 # ------------------------------------------
 
 import os
+import csv
 import time
 import math
 import torch
@@ -21,6 +22,7 @@ from image_synthesis.distributed.distributed import is_primary, get_rank
 from image_synthesis.utils.misc import get_model_parameters_info
 from image_synthesis.engine.lr_scheduler import ReduceLROnPlateauWithWarmup, CosineAnnealingLRWithWarmup
 from image_synthesis.engine.ema import EMA
+from image_synthesis.engine.gradacc import GradientAccumulation
 from torch.optim.lr_scheduler import ReduceLROnPlateau, CosineAnnealingLR
 
 try:
@@ -35,6 +37,27 @@ import trimesh
 
 
 STEP_WITH_LOSS_SCHEDULERS = (ReduceLROnPlateauWithWarmup, ReduceLROnPlateau)
+
+
+class CSVLogger:
+    """Simple CSV logger that appends rows to a file."""
+
+    def __init__(self, filepath, fieldnames):
+        self.filepath = filepath
+        self.fieldnames = fieldnames
+        write_header = not os.path.exists(filepath)
+        self._file = open(filepath, 'a', newline='')
+        self._writer = csv.DictWriter(self._file, fieldnames=fieldnames, extrasaction='ignore')
+        if write_header:
+            self._writer.writeheader()
+            self._file.flush()
+
+    def log(self, row_dict):
+        self._writer.writerow(row_dict)
+        self._file.flush()
+
+    def close(self):
+        self._file.close()
 
 
 class Solver(object):
@@ -111,6 +134,33 @@ class Solver(object):
             self.scaler = GradScaler()
             self.logger.log_info('Using AMP for training!')
 
+        self.gradacc = {}
+        for name, op_sc in self.optimizer_and_scheduler.items():
+            opt = op_sc['optimizer']['module']
+            self.gradacc[name] = GradientAccumulation(
+                actual_batch_size=config['dataloader']['batch_size'],
+                expect_batch_size=config['dataloader']['accumulated_batch_size'],
+                loader_len=self.dataloader['train_iterations'],
+                optimizer=opt,
+                grad_scaler=self.scaler if self.args.amp else None,
+                clip_grad_norm_fn=self.clip_grad_norm,      # <- your existing function
+                clip_params=self.model.parameters(),        # <- parameters to clip
+            )
+
+        # CSV logger for loss curves (only on primary)
+        if is_primary():
+            csv_path = os.path.join(args.save_dir, 'training_log.csv')
+            self.csv_logger = CSVLogger(csv_path, fieldnames=[
+                'timestamp', 'epoch', 'iteration', 'global_step', 'phase',
+                'loss', 'lpl_loss', 'schedule_reg_loss',
+                'lr', 'diffusion_acc', 'diffusion_keep',
+                'val_token_accuracy', 'val_acc_early', 'val_acc_mid', 'val_acc_late',
+                'data_time', 'step_time',
+            ])
+            self.logger.log_info('CSV logger: {}'.format(csv_path))
+        else:
+            self.csv_logger = None
+
         self.logger.log_info("{}: global rank {}: prepare solver done!".format(self.args.name,self.args.global_rank), check_primary=False)
 
     def _get_optimizer_and_scheduler(self, op_sc_list):
@@ -136,14 +186,37 @@ class Solver(object):
                     print(f"[OPTIMIZED] {name} | shape: {tuple(p.shape)}")
                 else:
                     print(f"[FROZEN] {name} | shape: {tuple(p.shape)}")
-            
+
             # build optimizer
             op_cfg = op_sc_cfg.get('optimizer', {'target': 'torch.optim.SGD', 'params': {}})
             if 'params' not in op_cfg:
                 op_cfg['params'] = {}
             if 'lr' not in op_cfg['params']:
                 op_cfg['params']['lr'] = self.lr
-            op_cfg['params']['params'] = parameters
+
+            # Check if model has a schedule network that needs a separate LR
+            schedule_lr_scale = self.config.get('solver', {}).get('schedule_lr_scale', None)
+            _model = self.model.module if isinstance(self.model, torch.nn.parallel.DistributedDataParallel) else self.model
+            has_schedule_net = (hasattr(_model, 'transformer') and
+                               hasattr(_model.transformer, 'schedule_net') and
+                               _model.transformer.schedule_net is not None and
+                               schedule_lr_scale is not None)
+
+            if has_schedule_net and op_sc['name'] == 'none':
+                # Separate param groups: schedule network gets scaled LR
+                schedule_params = _model.transformer.get_schedule_params()
+                schedule_param_ids = {id(p) for p in schedule_params}
+                main_params = [p for p in self.model.parameters()
+                               if p.requires_grad and id(p) not in schedule_param_ids]
+                main_lr = op_cfg['params']['lr']
+                schedule_lr = main_lr * schedule_lr_scale
+                self.logger.log_info(f'Schedule network LR: {schedule_lr} (scale={schedule_lr_scale}, base={main_lr})')
+                op_cfg['params']['params'] = [
+                    {'params': main_params, 'lr': main_lr},
+                    {'params': schedule_params, 'lr': schedule_lr},
+                ]
+            else:
+                op_cfg['params']['params'] = parameters
             optimizer = instantiate_from_config(op_cfg)
             op_sc['optimizer'] = {
                 'module': optimizer,
@@ -156,9 +229,15 @@ class Solver(object):
                 sc_cfg = op_sc_cfg['scheduler']
                 sc_cfg['params']['optimizer'] = optimizer
                 # for cosine annealing lr, compute T_max
+                # Account for gradient accumulation: the scheduler only steps
+                # when the optimizer steps, so divide by the accumulation factor.
+                accum_factor = self.config['dataloader'].get('accumulated_batch_size', self.config['dataloader']['batch_size']) // self.config['dataloader']['batch_size']
                 if sc_cfg['target'].split('.')[-1] in ['CosineAnnealingLRWithWarmup', 'CosineAnnealingLR']:
-                    T_max = self.max_epochs * self.dataloader['train_iterations']
+                    T_max = self.max_epochs * self.dataloader['train_iterations'] // accum_factor
                     sc_cfg['params']['T_max'] = T_max
+                # Also adjust warmup steps for gradient accumulation
+                if 'warmup' in sc_cfg.get('params', {}):
+                    sc_cfg['params']['warmup'] = sc_cfg['params']['warmup'] // accum_factor
                 scheduler = instantiate_from_config(sc_cfg)
                 op_sc['scheduler'] = {
                     'module': scheduler,
@@ -274,50 +353,44 @@ class Solver(object):
                         output = self.model(**input)
                         #now we need to add the LPL loss
                         if self.last_iter >= self.config['solver'].get('lpl_start_iteration', 0):
-                            soft_z = self.model.content_codec.quantize.logits_to_soft_embedding(output['logits'], temp=1.0, dhw=(8,8,8), straight_through=False)
-                            self.lpl_loss = self.model.lpl(batch['indices'], soft_z, snr_t)
+                            # x0_logits is p(x0|xt) - the predicted clean distribution [B, N, K]
+                            soft_z = self.model.content_codec.quantize.logits_to_soft_embedding(output['x0_logits'], temp=1.0, dhw=(8,8,8), straight_through=False)
                             snr_t = self.model.transformer.get_snr(output['t'])
-                            output['loss'] = output['loss'] + 0.1 * self.lpl_loss #TODO: weight for LPL loss
-                            wandb.log({"train/lpl_loss": self.lpl_loss.item()}, step=self.model.transformer._global_step)
+                            self.lpl_loss = self.model.lpl(batch['indices'], soft_z, snr_t)
+                            output['loss'] = output['loss'] + 10.0 * self.lpl_loss #TODO: weight for LPL loss
+                            wandb.log({"train/lpl_loss": 10.0 * self.lpl_loss.item()}, step=self.model.transformer._global_step)
                 else:
                     output = self.model(**input)
                     if self.last_iter >= self.config['solver'].get('lpl_start_iteration', 0):
-                        soft_z = self.model.content_codec.quantize.logits_to_soft_embedding(output['logits'], temp=1.0, dhw=(8,8,8), straight_through=False)
+                        soft_z = self.model.content_codec.quantize.logits_to_soft_embedding(output['x0_logits'], temp=1.0, dhw=(8,8,8), straight_through=False)
                         snr_t = self.model.transformer.get_snr(output['t'])
                         self.lpl_loss = self.model.lpl(batch['indices'], soft_z, snr_t)
-                        output['loss'] = output['loss'] + 0.1 * self.lpl_loss #TODO: weight for LPL loss
-                        wandb.log({"train/lpl_loss": self.lpl_loss.item()}, step=self.model.transformer._global_step)
-            else:
+                        output['loss'] = output['loss'] + 10.0 * self.lpl_loss #TODO: weight for LPL loss
+                        wandb.log({"train/lpl_loss": 10.0 * self.lpl_loss.item()}, step=self.model.transformer._global_step)
+
+                ga = self.gradacc[op_sc_n]
+                step_in_epoch = self.last_iter % ga.loader_len
+
+                took_step = ga.step(output['loss'], step=step_in_epoch)
+
+                # ---- Scheduler & EMA only when we actually updated params ----
+                if took_step:
+                    if 'scheduler' in op_sc:
+                        if isinstance(op_sc['scheduler']['module'], STEP_WITH_LOSS_SCHEDULERS):
+                            op_sc['scheduler']['module'].step(output.get('loss'))
+                        else:
+                            op_sc['scheduler']['module'].step()
+
+                    if self.ema is not None:
+                        self.ema.update(iteration=self.last_iter)
+
+            else:  # phase != 'train'
                 with torch.no_grad():
                     if self.args.amp:
                         with autocast():
                             output = self.model(**input)
                     else:
                         output = self.model(**input)
-            if phase == 'train':
-                if op_sc['optimizer']['step_iteration'] > 0 and (self.last_iter + 1) % op_sc['optimizer']['step_iteration'] == 0:
-                    op_sc['optimizer']['module'].zero_grad()
-                    if self.args.amp:
-                        self.scaler.scale(output['loss']).backward()
-                        if self.clip_grad_norm is not None:
-                            self.clip_grad_norm(self.model.parameters())
-                        self.scaler.step(op_sc['optimizer']['module'])
-                        self.scaler.update()
-                    else:
-                        output['loss'].backward()
-                        if self.clip_grad_norm is not None:
-                            self.clip_grad_norm(self.model.parameters())
-                        op_sc['optimizer']['module'].step()
-                    
-                if 'scheduler' in op_sc:
-                    if op_sc['scheduler']['step_iteration'] > 0 and (self.last_iter + 1) % op_sc['scheduler']['step_iteration'] == 0:
-                        if isinstance(op_sc['scheduler']['module'], STEP_WITH_LOSS_SCHEDULERS):
-                            op_sc['scheduler']['module'].step(output.get('loss'))
-                        else:
-                            op_sc['scheduler']['module'].step()
-                # update ema model
-                if self.ema is not None:
-                    self.ema.update(iteration=self.last_iter)
 
             loss[op_sc_n] = {k: v for k, v in output.items() if ('loss' in k or 'acc' in k)}
         return loss
@@ -459,11 +532,47 @@ class Solver(object):
                 for k in lrs.keys():
                     lr = lrs[k]
                     self.logger.add_scalar(tag='train/{}_lr'.format(k), scalar_value=lrs[k], global_step=self.last_iter)
-                    #wandb.log({f"train/{k}_lr": lr}, step=self.last_iter)
+                    wandb.log({f"train/{k}_lr": lr}, step=self.model.transformer._global_step)
 
                 # add lr to info
                 info += ' || {}'.format(self._get_lr())
                     
+                # CSV logging
+                if self.csv_logger is not None:
+                    # Get transformer ref for global_step
+                    if isinstance(self.model, torch.nn.parallel.DistributedDataParallel):
+                        _transformer = self.model.module.transformer
+                    else:
+                        _transformer = self.model.transformer
+                    csv_row = {
+                        'timestamp': time.strftime('%Y-%m-%d %H:%M:%S'),
+                        'epoch': self.last_epoch,
+                        'iteration': self.last_iter,
+                        'global_step': _transformer._global_step,
+                        'phase': 'train',
+                        'lr': list(lrs.values())[0] if lrs else 0.0,
+                        'data_time': round(data_time, 3),
+                        'step_time': round(time.time() - step_start, 3),
+                    }
+                    for loss_n, loss_dict in loss.items():
+                        for k, v in loss_dict.items():
+                            if k == 'loss':
+                                csv_row['loss'] = round(float(v), 6)
+                    if hasattr(self, 'lpl_loss') and self.lpl_loss is not None:
+                        csv_row['lpl_loss'] = round(float(self.lpl_loss), 6)
+                    # Diffusion acc/keep
+                    with torch.no_grad():
+                        acc_arr = [x for x in _transformer.diffusion_acc_list if x > 0]
+                        keep_arr = [x for x in _transformer.diffusion_keep_list if x > 0]
+                        if acc_arr:
+                            csv_row['diffusion_acc'] = round(sum(acc_arr) / len(acc_arr), 6)
+                        if keep_arr:
+                            csv_row['diffusion_keep'] = round(sum(keep_arr) / len(keep_arr), 6)
+                    # Schedule reg loss
+                    if hasattr(_transformer, '_last_schedule_reg_loss'):
+                        csv_row['schedule_reg_loss'] = round(_transformer._last_schedule_reg_loss, 6)
+                    self.csv_logger.log(csv_row)
+
                 # add time consumption to info
                 spend_time = time.time() - self.start_train_time
                 itr_time_avg = spend_time / (self.last_iter + 1)
@@ -511,10 +620,59 @@ class Solver(object):
             epoch_start = time.time()
             itr_start = time.time()
             itr = -1
+            
+            # Metrics accumulators
+            total_token_correct = 0
+            total_tokens = 0
+            timestep_acc = {}  # {t: (correct, total)}
+            all_diffusion_acc = []
+            
             for itr, batch in enumerate(self.dataloader['validation_loader']):
                 data_time = time.time() - itr_start
                 step_start = time.time()
-                loss = self.step(batch, phase='val')
+                
+                # Get model output with additional info for metrics
+                with torch.no_grad():
+                    for k, v in batch.items():
+                        if torch.is_tensor(v):
+                            batch[k] = v.cuda()
+                    
+                    input_data = {
+                        'batch': batch,
+                        'return_loss': True,
+                        'return_logits': True,
+                        'return_timesteps': True,
+                        'step': self.last_iter,
+                    }
+                    
+                    if self.args.amp:
+                        with autocast():
+                            output = self.model(**input_data)
+                    else:
+                        output = self.model(**input_data)
+                    
+                    # Compute token-level accuracy from x0_logits
+                    if 'x0_logits' in output and 'indices' in batch:
+                        x0_logits = output['x0_logits']  # [B, N, K]
+                        gt_indices = batch['indices']     # [B, N]
+                        pred_indices = x0_logits.argmax(dim=-1)  # [B, N]
+                        
+                        correct = (pred_indices == gt_indices).float()
+                        total_token_correct += correct.sum().item()
+                        total_tokens += gt_indices.numel()
+                        
+                        # Per-timestep accuracy
+                        if 't' in output:
+                            t = output['t']  # [B]
+                            for b_idx in range(t.shape[0]):
+                                t_val = t[b_idx].item()
+                                if t_val not in timestep_acc:
+                                    timestep_acc[t_val] = [0, 0]
+                                timestep_acc[t_val][0] += correct[b_idx].sum().item()
+                                timestep_acc[t_val][1] += correct[b_idx].numel()
+                
+                # Collect loss for averaging
+                loss = {'none': {k: v for k, v in output.items() if ('loss' in k or 'acc' in k)}}
                 
                 for loss_n, loss_dict in loss.items():
                     loss[loss_n] = reduce_dict(loss_dict)
@@ -531,7 +689,6 @@ class Solver(object):
                     for loss_n, loss_dict in loss.items():
                         info += ' ||'
                         info += '' if loss_n == 'none' else ' {}'.format(loss_n)
-                        # info = info + ': Epoch {}/{} | iter {}/{}'.format(self.last_epoch, self.max_epochs, itr, self.dataloader['validation_iterations'])
                         for k in loss_dict:
                             info += ' | {}: {:.4f}'.format(k, float(loss_dict[k]))
                         
@@ -546,9 +703,24 @@ class Solver(object):
                         
                     self.logger.log_info(info)
                 itr_start = time.time()
+            
             # modify here to make sure dataloader['validation_iterations'] is correct
             assert itr >= 0, "The data is too less to form one iteration!"
             self.dataloader['validation_iterations'] = itr + 1
+
+            # Compute final metrics
+            val_token_acc = total_token_correct / max(total_tokens, 1)
+            
+            # Compute per-timestep accuracy for early/mid/late bins
+            early_acc, mid_acc, late_acc = [], [], []
+            for t_val, (corr, tot) in timestep_acc.items():
+                acc = corr / max(tot, 1)
+                if t_val < 33:
+                    late_acc.append(acc)   # Low t = late in diffusion (clean)
+                elif t_val < 66:
+                    mid_acc.append(acc)
+                else:
+                    early_acc.append(acc)  # High t = early in diffusion (noisy)
 
             if self.logger is not None:
                 info = '{}: val'.format(self.args.name) 
@@ -558,8 +730,60 @@ class Solver(object):
                     for k in loss_dict:
                         info += ' | {}: {:.4f}'.format(k, float(loss_dict[k]))
                         self.logger.add_scalar(tag='val/{}/{}'.format(loss_n, k), scalar_value=float(loss_dict[k]), global_step=self.last_epoch)
+                info += ' | token_acc: {:.4f}'.format(val_token_acc)
                 self.logger.log_info(info)
-            wandb.log({f"val/loss": overall_loss["none"]["loss"].item()})
+            
+            # Log comprehensive metrics to wandb
+            val_metrics = {
+                "val/loss": overall_loss["none"]["loss"].item() if "loss" in overall_loss["none"] else 0.0,
+                "val/token_accuracy": val_token_acc,
+                "val/epoch": self.last_epoch,
+            }
+            
+            # Add timestep-binned accuracies
+            if early_acc:
+                val_metrics["val/acc_early_t66-99"] = sum(early_acc) / len(early_acc)
+            if mid_acc:
+                val_metrics["val/acc_mid_t33-66"] = sum(mid_acc) / len(mid_acc)
+            if late_acc:
+                val_metrics["val/acc_late_t0-33"] = sum(late_acc) / len(late_acc)
+            
+            # Add diffusion transformer metrics if available
+            if isinstance(self.model, torch.nn.parallel.DistributedDataParallel):
+                transformer = self.model.module.transformer
+            else:
+                transformer = self.model.transformer
+            
+            if hasattr(transformer, 'diffusion_acc_list'):
+                acc_arr = [x for x in transformer.diffusion_acc_list if x > 0]
+                keep_arr = [x for x in transformer.diffusion_keep_list if x > 0]
+                if acc_arr:
+                    val_metrics["val/diffusion_acc_mean"] = sum(acc_arr) / len(acc_arr)
+                if keep_arr:
+                    val_metrics["val/diffusion_keep_mean"] = sum(keep_arr) / len(keep_arr)
+            
+            # Use the global training step for consistent wandb logging
+            global_step = transformer._global_step if hasattr(transformer, '_global_step') else self.last_iter
+            wandb.log(val_metrics, step=global_step)
+
+            # CSV logging for validation
+            if self.csv_logger is not None:
+                csv_row = {
+                    'timestamp': time.strftime('%Y-%m-%d %H:%M:%S'),
+                    'epoch': self.last_epoch,
+                    'iteration': self.last_iter,
+                    'global_step': global_step,
+                    'phase': 'val',
+                    'loss': round(float(val_metrics.get('val/loss', 0.0)), 6),
+                    'val_token_accuracy': round(val_token_acc, 6),
+                }
+                if early_acc:
+                    csv_row['val_acc_early'] = round(sum(early_acc) / len(early_acc), 6)
+                if mid_acc:
+                    csv_row['val_acc_mid'] = round(sum(mid_acc) / len(mid_acc), 6)
+                if late_acc:
+                    csv_row['val_acc_late'] = round(sum(late_acc) / len(late_acc), 6)
+                self.csv_logger.log(csv_row)
                 
             
 

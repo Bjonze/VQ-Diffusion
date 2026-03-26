@@ -68,6 +68,134 @@ def alpha_schedule(time_step, N=100, att_1 = 0.99999, att_T = 0.000009, ctt_1 = 
     btt = (1-att-ctt)/N
     return at, bt, ct, att, btt, ctt
 
+class LearnableScheduleNetwork(nn.Module):
+    """Small MLP that predicts delta-logits for the diffusion schedule.
+
+    The schedule is parameterised as log_softmax over 3 logits per timestep:
+        log(alpha_t, N*beta_t, gamma_t) = log_softmax(base_logits[t] + scale * net(t))
+    When the network outputs zeros (at init), the schedule equals the fixed base.
+    """
+
+    def __init__(
+        self,
+        num_timesteps,
+        num_classes,
+        t_embed_dim=128,
+        global_feat_dim=32,
+        hidden_dim=256,
+        residual_scale=0.3,
+        endpoint_reg_weight=0.1,
+        smoothness_reg_weight=0.1,
+        monotonicity_reg_weight=1.0,
+    ):
+        super().__init__()
+        self.num_timesteps = num_timesteps
+        self.num_classes = num_classes
+        self.residual_scale = residual_scale
+        self.endpoint_reg_weight = endpoint_reg_weight
+        self.smoothness_reg_weight = smoothness_reg_weight
+        self.monotonicity_reg_weight = monotonicity_reg_weight
+        self.t_embed_dim = t_embed_dim
+
+        # Learnable global features concatenated with time embedding
+        self.global_feat = nn.Parameter(torch.zeros(global_feat_dim))
+
+        # Sinusoidal time embedding (precomputed frequencies)
+        half = t_embed_dim // 2
+        freqs = torch.exp(-math.log(10000.0) * torch.arange(0, half, dtype=torch.float32) / half)
+        self.register_buffer('freqs', freqs)  # [half]
+
+        # 3-layer MLP: (t_embed_dim + global_feat_dim) -> hidden -> hidden -> 3
+        input_dim = t_embed_dim + global_feat_dim
+        self.net = nn.Sequential(
+            nn.Linear(input_dim, hidden_dim),
+            nn.SiLU(),
+            nn.Linear(hidden_dim, hidden_dim),
+            nn.SiLU(),
+            nn.Linear(hidden_dim, 3),
+        )
+        # Zero-init the last layer so output starts at 0
+        nn.init.zeros_(self.net[-1].weight)
+        nn.init.zeros_(self.net[-1].bias)
+
+        # base_logits will be registered by DiffusionTransformer after computing the fixed schedule
+        # Shape: [T, 3]  (log(alpha), log(N*beta), log(gamma))
+        self.register_buffer('base_logits', torch.zeros(num_timesteps, 3))
+
+    def _time_embed(self, t_indices):
+        """Sinusoidal embedding for integer timestep indices. t_indices: [T] or [B]."""
+        t = t_indices.float().unsqueeze(-1)  # [T, 1]
+        args = t * self.freqs.unsqueeze(0)   # [T, half]
+        return torch.cat([torch.sin(args), torch.cos(args)], dim=-1)  # [T, t_embed_dim]
+
+    def forward(self):
+        """Return per-step log(at), log(bt), log(ct) and regularisation loss.
+
+        Uses log_softmax for numerical stability (avoids softmax -> log -> clamp chain).
+
+        Returns:
+            log_at:   [T] log of alpha_t
+            log_bt:   [T] log of beta_t  (per-class, i.e. divided by N)
+            log_ct:   [T] log of gamma_t
+            reg_loss: scalar regularisation loss
+        """
+        T = self.num_timesteps
+        N = self.num_classes - 1  # number of non-mask classes
+        log_N = math.log(N)
+
+        # Time embedding for all timesteps
+        t_indices = torch.arange(T, device=self.base_logits.device)
+        t_emb = self._time_embed(t_indices)  # [T, t_embed_dim]
+
+        # Expand global features to all timesteps
+        global_feat = self.global_feat.unsqueeze(0).expand(T, -1)  # [T, global_feat_dim]
+        inp = torch.cat([t_emb, global_feat], dim=-1)  # [T, input_dim]
+
+        # Delta logits scaled by residual_scale
+        delta = self.residual_scale * self.net(inp)  # [T, 3]
+        logits = self.base_logits + delta             # [T, 3]
+
+        # log_softmax: numerically stable log-probabilities directly
+        # Columns: [log(alpha_t), log(N*beta_t), log(gamma_t)]
+        log_probs = F.log_softmax(logits, dim=-1)  # [T, 3]
+
+        log_at = log_probs[:, 0]                    # log(alpha_t)
+        log_bt = log_probs[:, 1] - log_N            # log(beta_t) = log(N*beta_t) - log(N)
+        log_ct = log_probs[:, 2]                    # log(gamma_t)
+
+        # --- Regularisation ---
+        reg_loss = torch.tensor(0.0, device=logits.device)
+
+        # 1) Endpoint regularisation: keep t=0 and t=T-1 close to base
+        if self.endpoint_reg_weight > 0:
+            endpoint_loss = (
+                (logits[0] - self.base_logits[0]).pow(2).sum()
+                + (logits[-1] - self.base_logits[-1]).pow(2).sum()
+            )
+            reg_loss = reg_loss + self.endpoint_reg_weight * endpoint_loss
+
+        # 2) Smoothness regularisation: penalise large jumps between consecutive steps
+        if self.smoothness_reg_weight > 0 and T > 1:
+            diffs = logits[1:] - logits[:-1]  # [T-1, 3]
+            smooth_loss = diffs.pow(2).sum()
+            reg_loss = reg_loss + self.smoothness_reg_weight * smooth_loss
+
+        # 3) Monotonicity regularisation: cumulative alpha should decrease (log_at should be negative)
+        #    and cumulative gamma should increase. Penalise any timestep where cumulative alpha
+        #    increases (i.e., log_at[t] > 0 significantly).
+        if self.monotonicity_reg_weight > 0 and T > 1:
+            # Cumulative log_at; differences should be <= 0 for monotonic decrease of cum. alpha
+            log_cumprod_at = torch.cumsum(log_at, dim=0)
+            # Penalise any increase in cumulative alpha between consecutive steps
+            cum_alpha_diffs = log_cumprod_at[1:] - log_cumprod_at[:-1]  # = log_at[1:]
+            # Only penalise positive values (violations of monotonicity)
+            mono_violations = F.relu(cum_alpha_diffs + 0.001)  # small margin
+            mono_loss = mono_violations.pow(2).sum()
+            reg_loss = reg_loss + self.monotonicity_reg_weight * mono_loss
+
+        return log_at.float(), log_bt.float(), log_ct.float(), reg_loss.float()
+
+
 class DiffusionTransformer(nn.Module):
     def __init__(
         self,
@@ -83,9 +211,13 @@ class DiffusionTransformer(nn.Module):
         mask_weight=[1,1],
 
         learnable_cf=False,
+        learnable_schedule=False,
+        schedule_network_config=None,
+        schedule_warmup_steps=5000,
     ):
         super().__init__()
         self._global_step = 0
+        self.schedule_warmup_steps = schedule_warmup_steps
 
 
         if condition_emb_config is None:
@@ -136,15 +268,45 @@ class DiffusionTransformer(nn.Module):
 
         self.diffusion_acc_list = [0] * self.num_timesteps
         self.diffusion_keep_list = [0] * self.num_timesteps
-        # Convert to float32 and register buffers.
-        self.register_buffer('log_at', log_at.float())
-        self.register_buffer('log_bt', log_bt.float())
-        self.register_buffer('log_ct', log_ct.float())
-        self.register_buffer('log_cumprod_at', log_cumprod_at.float())
-        self.register_buffer('log_cumprod_bt', log_cumprod_bt.float())
-        self.register_buffer('log_cumprod_ct', log_cumprod_ct.float())
-        self.register_buffer('log_1_min_ct', log_1_min_ct.float())
-        self.register_buffer('log_1_min_cumprod_ct', log_1_min_cumprod_ct.float())
+
+        self.learnable_schedule = learnable_schedule
+        if self.learnable_schedule:
+            # Build schedule network
+            sn_cfg = schedule_network_config or {}
+            self.schedule_net = LearnableScheduleNetwork(
+                num_timesteps=self.num_timesteps,
+                num_classes=self.num_classes,
+                **sn_cfg,
+            )
+            # Compute base logits: log(alpha), log(N*beta), log(gamma)
+            N = self.num_classes - 1
+            base_logits = torch.stack([
+                log_at.float(),
+                torch.log((N * bt).clamp(min=1e-30)).float(),
+                log_ct.float(),
+            ], dim=-1)  # [T, 3]
+            self.schedule_net.base_logits.copy_(base_logits)
+
+            # Register schedule buffers (will be overwritten by _recompute_schedule)
+            self.register_buffer('log_at', log_at.float())
+            self.register_buffer('log_bt', log_bt.float())
+            self.register_buffer('log_ct', log_ct.float())
+            self.register_buffer('log_cumprod_at', log_cumprod_at.float())
+            self.register_buffer('log_cumprod_bt', log_cumprod_bt.float())
+            self.register_buffer('log_cumprod_ct', log_cumprod_ct.float())
+            self.register_buffer('log_1_min_ct', log_1_min_ct.float())
+            self.register_buffer('log_1_min_cumprod_ct', log_1_min_cumprod_ct.float())
+        else:
+            self.schedule_net = None
+            # Convert to float32 and register buffers (original behaviour).
+            self.register_buffer('log_at', log_at.float())
+            self.register_buffer('log_bt', log_bt.float())
+            self.register_buffer('log_ct', log_ct.float())
+            self.register_buffer('log_cumprod_at', log_cumprod_at.float())
+            self.register_buffer('log_cumprod_bt', log_cumprod_bt.float())
+            self.register_buffer('log_cumprod_ct', log_cumprod_ct.float())
+            self.register_buffer('log_1_min_ct', log_1_min_ct.float())
+            self.register_buffer('log_1_min_cumprod_ct', log_1_min_cumprod_ct.float())
 
         self.register_buffer('Lt_history', torch.zeros(self.num_timesteps))
         self.register_buffer('Lt_count', torch.zeros(self.num_timesteps))
@@ -153,14 +315,85 @@ class DiffusionTransformer(nn.Module):
         if learnable_cf:
             self.empty_text_embed = torch.nn.Parameter(torch.randn(size=(19, 128), requires_grad=True, dtype=torch.float64))
 
-        self.prior_rule = 2    # inference rule: 0 for VQ-Diffusion v1, 1 for only high-quality inference, 2 for purity prior
+        self.prior_rule = 1    # inference rule: 0 for VQ-Diffusion v1, 1 for only high-quality inference, 2 for purity prior
         self.prior_ps = 512   # max number to sample per step
         self.prior_weight = 0  # probability adjust parameter, 'r' in Equation.11 of Improved VQ-Diffusion
 
         self.update_n_sample()
         
         self.learnable_cf = learnable_cf
-    
+
+    def _recompute_schedule(self):
+        """Recompute all schedule buffers from the learnable schedule network.
+
+        During warmup (first schedule_warmup_steps), the schedule network is frozen
+        so the transformer can stabilize before the schedule starts adapting.
+        """
+        if self.schedule_net is None:
+            return torch.tensor(0.0, device=self.log_at.device)
+
+        # During warmup, detach schedule from gradient graph
+        in_warmup = self.training and self._global_step < self.schedule_warmup_steps
+        if in_warmup:
+            with torch.no_grad():
+                log_at, log_bt, log_ct, _ = self.schedule_net()
+            reg_loss = torch.tensor(0.0, device=self.log_at.device)
+        else:
+            log_at, log_bt, log_ct, reg_loss = self.schedule_net()
+
+        N = self.num_classes - 1
+
+        # Per-step values
+        self.log_at = log_at
+        self.log_bt = log_bt
+        self.log_ct = log_ct
+        # log(1 - ct) using log1p for better numerical precision
+        self.log_1_min_ct = torch.log1p(-torch.exp(log_ct).clamp(max=1.0 - 1e-7))
+
+        # Cumulative products via cumsum in log-space
+        log_cumprod_at = torch.cumsum(log_at, dim=0)
+
+        # For cumulative gamma: ctt = 1 - prod(1 - ct[i])
+        log_1_min_ct_all = torch.log1p(-torch.exp(log_ct).clamp(max=1.0 - 1e-7))
+        log_cumsum_1_min_ct = torch.cumsum(log_1_min_ct_all, dim=0)
+        # log(ctt) = log(1 - exp(log_cumsum_1_min_ct))
+        log_cumprod_ct = torch.log1p(-torch.exp(log_cumsum_1_min_ct).clamp(max=1.0 - 1e-7))
+
+        # Cumulative beta: btt = (1 - att - ctt) / N
+        att = torch.exp(log_cumprod_at)
+        ctt = torch.exp(log_cumprod_ct)
+        btt = ((1.0 - att - ctt) / N).clamp(min=1e-30)
+        log_cumprod_bt = torch.log(btt)
+
+        # Append identity at position T: att[T]=1, ctt[T]=0, btt[T]=0
+        log_cumprod_at = torch.cat([log_cumprod_at, torch.tensor([0.0], device=log_at.device)])
+        log_cumprod_bt = torch.cat([log_cumprod_bt, torch.tensor([-70.0], device=log_at.device)])
+        log_cumprod_ct = torch.cat([log_cumprod_ct, torch.tensor([-70.0], device=log_at.device)])
+
+        # Clamp for numerical stability
+        log_cumprod_at = torch.clamp(log_cumprod_at, -70, 0)
+        log_cumprod_bt = torch.clamp(log_cumprod_bt, -70, 0)
+        log_cumprod_ct = torch.clamp(log_cumprod_ct, -70, 0)
+
+        self.log_cumprod_at = log_cumprod_at
+        self.log_cumprod_bt = log_cumprod_bt
+        self.log_cumprod_ct = log_cumprod_ct
+        self.log_1_min_cumprod_ct = torch.log1p(-torch.exp(log_cumprod_ct).clamp(max=1.0 - 1e-7))
+
+        return reg_loss
+
+    def get_schedule_params(self):
+        """Return schedule network parameters (for separate LR group)."""
+        if self.schedule_net is not None:
+            return list(self.schedule_net.parameters())
+        return []
+
+    def get_non_schedule_params(self):
+        """Return all parameters except schedule network (for main LR group)."""
+        schedule_param_ids = set()
+        if self.schedule_net is not None:
+            schedule_param_ids = {id(p) for p in self.schedule_net.parameters()}
+        return [p for p in self.parameters() if id(p) not in schedule_param_ids and p.requires_grad]
 
     # def update_n_sample(self):
     #     if self.num_timesteps == 100:
@@ -330,8 +563,6 @@ class DiffusionTransformer(nn.Module):
 
         max_sample_per_step = self.prior_ps  # max number to sample per step
         if t[0] > 0 and self.prior_rule > 0 and to_sample is not None: # prior_rule: 0 for VQ-Diffusion v1, 1 for only high-quality inference, 2 for purity prior
-            if t[0] == 50:
-                print("LOL")
             log_x_idx = log_onehot_to_index(log_x)
 
             if self.prior_rule == 1:
@@ -418,6 +649,9 @@ class DiffusionTransformer(nn.Module):
     def _train_loss(self, x, cond_emb, is_train=True):                       # get the KL loss
         b, device = x.size(0), x.device
 
+        # Recompute schedule from learnable network (no-op if fixed schedule)
+        schedule_reg_loss = self._recompute_schedule()
+
         assert self.loss_type == 'vb_stochastic'
         x_start = x
         t, pt = self.sample_time(b, device, 'importance')
@@ -481,7 +715,7 @@ class DiffusionTransformer(nn.Module):
             loss2 = addition_loss_weight * self.auxiliary_loss_weight * kl_aux_loss / pt
             vb_loss += loss2
         
-        return log_model_prob, vb_loss, t
+        return log_model_prob, log_x0_recon, vb_loss, t, schedule_reg_loss
 
 
     @property
@@ -590,8 +824,12 @@ class DiffusionTransformer(nn.Module):
             
         # now we get cond_emb and sample_image
         if is_train == True:
-            log_model_prob, loss, t = self._train_loss(sample_image, cond_emb)
+            log_model_prob, log_x0_recon, loss, t, schedule_reg_loss = self._train_loss(sample_image, cond_emb)
             loss = loss.sum()/(sample_image.size()[0] * sample_image.size()[1])
+
+            # Add schedule regularisation loss (0 when fixed schedule)
+            self._last_schedule_reg_loss = schedule_reg_loss.item() if torch.is_tensor(schedule_reg_loss) else 0.0
+            loss = loss + schedule_reg_loss
 
             if is_primary():
                 # diffusion_acc_list/diffusion_keep_list are per-timestep moving avgs (Python list of floats)
@@ -608,21 +846,24 @@ class DiffusionTransformer(nn.Module):
                     diffusion_acc_mean = acc_valid.mean().item() if acc_valid.numel() > 0 else 0.0
                     diffusion_keep_mean = keep_valid.mean().item() if keep_valid.numel() > 0 else 0.0
 
-                wandb.log(
-                    {
-                        "train/loss": loss.item(),
-                        "train/diffusion_acc_mean": diffusion_acc_mean,
-                        "train/diffusion_keep_mean": diffusion_keep_mean,
-                        "train/batch_size": float(batch_size),
-                    },
-                    step=self._global_step,
-                )
+                log_dict = {
+                    "train/loss": loss.item(),
+                    "train/diffusion_acc_mean": diffusion_acc_mean,
+                    "train/diffusion_keep_mean": diffusion_keep_mean,
+                    "train/batch_size": float(batch_size),
+                }
+                if self.learnable_schedule:
+                    log_dict["train/schedule_reg_loss"] = schedule_reg_loss.item()
+                wandb.log(log_dict, step=self._global_step)
                 self._global_step += 1
 
         # 4) get output, especially loss
         out = {}
         if return_logits:
             out['logits'] = torch.exp(log_model_prob)
+            # x0_logits: p(x0|xt) for LPL - shape [B, N, K] (excludes mask class)
+            x0_probs = torch.exp(log_x0_recon)[:, :-1, :]  # [B, K, N] -> remove mask class
+            out['x0_logits'] = x0_probs.permute(0, 2, 1)   # [B, N, K]
 
         if return_loss:
             out['loss'] = loss 
@@ -659,6 +900,9 @@ class DiffusionTransformer(nn.Module):
     
         device = self.log_at.device
         start_step = int(self.num_timesteps * filter_ratio)
+
+        # Recompute schedule from learnable network before sampling
+        self._recompute_schedule()
 
         # get cont_emb and cond_emb
         if content_token != None:
@@ -732,6 +976,9 @@ class DiffusionTransformer(nn.Module):
         batch_size = input['condition_token'].shape[0]
         device = self.log_at.device
         start_step = int(self.num_timesteps * filter_ratio)
+
+        # Recompute schedule from learnable network before sampling
+        self._recompute_schedule()
 
         # get cont_emb and cond_emb
         if content_token != None:
