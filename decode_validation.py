@@ -165,10 +165,18 @@ class VQ_Diffusion():
 
 
 if __name__ == '__main__':
-    model_name = 'laa_late_lpl'
+    guidance_scale = 0.0
+    learnable_cf = True
+    prior_rule = 2
+    prior_weight = 0
+    infer_speed = False
+    truncation_rate = 1.0
+
+    model_name = 'laa_normal_baseline_fresh'
     out_root = "/data/Data/generated_validation"
     k = 6
     VQ_Diffusion_model = VQ_Diffusion(config=f'configs/{model_name}.yaml', path=f'/storage/code/VQ_diffusion/outputs/{model_name}/checkpoint/last.pth')
+    VQ_Diffusion_model.model.eval()
     config = load_yaml_config(f'configs/{model_name}.yaml')
     config = merge_opts_to_config(config, None)
     config["dataloader"]["batch_size"] = k
@@ -177,13 +185,7 @@ if __name__ == '__main__':
     #loop over the validation dataloader
     val_dl = dataloader_info['validation_loader']
 
-    guidance_scale = 5.0
-    learnable_cf = False
-    prior_rule = 2
-    prior_weight = 0
-    infer_speed = False
-    VQ_Diffusion_model.model.eval()
-    truncation_rate = 1.0
+
     VQ_Diffusion_model.model.guidance_scale = guidance_scale
     VQ_Diffusion_model.model.learnable_cf = VQ_Diffusion_model.model.transformer.learnable_cf = learnable_cf # whether to use learnable classifier-free
     VQ_Diffusion_model.model.transformer.prior_rule = prior_rule      # inference rule: 0 for VQ-Diffusion v1, 1 for only high-quality inference, 2 for purity prior

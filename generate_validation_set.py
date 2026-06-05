@@ -27,20 +27,20 @@ from image_synthesis.data.npz_indices_ctx_dataset import NPZIndicesCtxDataset
 # Inference knobs (match your previous script defaults)
 LEARNABLE_CF = True
 PRIOR_RULE = 2
-GUIDANCE_SCALE = 20.0
+GUIDANCE_SCALE = 5.0
 PRIOR_WEIGHT = 2.0 #0.5, 1.0, 1.5, 2.0 
 TRUNCATION_RATE = 1.0
 INFER_SPEED = False  # False or float (e.g. 0.2)
 
 SEED = 42
 
-MODEL_NAME = "laa_normal_baseline"  # must match a config + checkpoint you have
+MODEL_NAME = "laa_normal_baseline_fresh"  # must match a config + checkpoint you have
 
 OUT_DIR = f"/data/Data/bjorn/vq_samples/{MODEL_NAME}/validation_set/prior_rule={PRIOR_RULE}_prior_weight={PRIOR_WEIGHT}_guidance={GUIDANCE_SCALE}"
 BATCH_SIZE = 4
 
 # Validation dataset
-VAL_DATA_ROOT = "/data/Data/latent_vectors/vqgan/ema_8x8x8_ctx_cosine_box_cox/"
+VAL_DATA_ROOT = "/data/Data/latent_vectors/vqgan/ema_8x8x8_ctx_cosine_box_cox_fresh/"
 VAL_PHASE = "val"
 
 CONNECTED_COMPONENTS = True  # if True, keeps only the largest connected component
@@ -49,7 +49,7 @@ ISO_LEVEL = 0.5
 MESH_EXT = "stl"  # "ply", "stl", or "vtp"
 
 SAVE_VOLUMES = True  # if True, saves .npz volumes too
-
+SAVE_MESHES = False
 
 
 
@@ -78,6 +78,7 @@ def load_model(model_name: str, device: torch.device) -> torch.nn.Module:
     model.transformer.prior_rule = PRIOR_RULE
     model.transformer.prior_weight = PRIOR_WEIGHT
     model.transformer.guidance_scale = GUIDANCE_SCALE
+    model.guidance_scale = GUIDANCE_SCALE
 
     return model
 
@@ -233,8 +234,9 @@ def main() -> None:
                 mesh_file = os.path.join(mesh_dir, f"{name}.{MESH_EXT}")
                 volume_file = ""
 
-                mesh = volume_to_mesh(vols[i], iso_level=ISO_LEVEL)
-                mesh.save(mesh_file)
+                if SAVE_MESHES:
+                    mesh = volume_to_mesh(vols[i], iso_level=ISO_LEVEL)
+                    mesh.save(mesh_file)
 
                 if SAVE_VOLUMES:
                     volume_file = os.path.join(vol_dir, f"{name}.npy")

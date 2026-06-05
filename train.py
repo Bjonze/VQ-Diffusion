@@ -27,7 +27,7 @@ DIST_URL = 'tcp://%s:%s' % (MASTER_ADDR, MASTER_PORT)
 
 def get_args():
     parser = argparse.ArgumentParser(description='PyTorch Training script')
-    parser.add_argument('--config_file', type=str, default='/storage/code/VQ_diffusion/configs/laa_normal_baseline.yaml',
+    parser.add_argument('--config_file', type=str, default='/storage/code/VQ_diffusion/configs/laa_normal_baseline_fresh.yaml',
                         help='path of config file')
     parser.add_argument('--name', type=str, default='', 
                         help='the name of this experiment, if not provided, set to'
